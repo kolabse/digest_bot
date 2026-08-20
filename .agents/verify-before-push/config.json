@@ -1,0 +1,39 @@
+{
+  "checks": [
+    {
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "cwd": ".",
+      "name": "unit-tests",
+      "required": true,
+      "timeout_seconds": 300
+    },
+    {
+      "command": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "cwd": ".",
+      "name": "lint",
+      "required": true,
+      "timeout_seconds": 300
+    }
+  ],
+  "evidence_file": ".agents/verify-before-push/evidence.json",
+  "repositories": [
+    {
+      "name": "digest-bot",
+      "path": ".",
+      "require_clean": true,
+      "require_upstream_current": false
+    }
+  ],
+  "version": 1
+}
