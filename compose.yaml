@@ -4,7 +4,4 @@ services:
     restart: unless-stopped
     env_file: ${ENV_FILE:-.env}
     volumes:
-      - digest-data:/app/data
-
-volumes:
-  digest-data:
+      - ./data:/app/data
