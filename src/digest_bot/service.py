@@ -42,7 +42,10 @@ class DeliveryService:
                     subscription.token_env,
                 )
                 document = extract_digest(markdown, due.digest_date)
-                message = render_message(document)
+                message = render_message(
+                    document,
+                    digest_is_today=due.digest_date == due.local_now.date(),
+                )
                 channel = self._channels[subscription.channel]
                 await channel.send(subscription.target, message)
                 self._storage.complete_delivery(subscription.id, digest_date, datetime.now(UTC))
@@ -74,4 +77,7 @@ class DeliveryService:
             subscription.ref,
             subscription.token_env,
         )
-        return render_message(extract_digest(markdown, digest_date))
+        return render_message(
+            extract_digest(markdown, digest_date),
+            digest_is_today=digest_date == local.date(),
+        )

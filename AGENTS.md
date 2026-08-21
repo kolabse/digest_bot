@@ -16,3 +16,10 @@ project-declared checks and require current evidence bound to the exact Git
 commits and worktrees being pushed. Treat missing, failed, malformed, or
 stale evidence as a stop condition for a protected push.
 <!-- verify-before-push:end -->
+
+<!-- orchestrate:start -->
+## Multi-agent orchestration
+
+Use the global `$orchestrate` skill for substantial tasks that benefit from
+multiple agents. Do not invoke it for trivial work.
+<!-- orchestrate:end -->

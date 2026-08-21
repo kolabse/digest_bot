@@ -53,6 +53,7 @@ async def test_dispatches_once_for_digest_date(tmp_path) -> None:
     target, message = channel.messages[0]
     assert target == "123"
     assert "19.08.2026" in message
+    assert "вчера" in message.lower()
     assert "Дайджест доставлен" in message
 
 
@@ -82,4 +83,5 @@ async def test_preview_works_during_quiet_window(tmp_path) -> None:
     )
 
     assert "19.08.2026" in message
+    assert "вчера" in message.lower()
     assert "Дайджест доставлен" in message
