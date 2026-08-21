@@ -118,6 +118,44 @@ class Storage:
         with self._connect() as connection:
             return [self._from_row(row) for row in connection.execute(query, params)]
 
+    def get_subscription(self, subscription_id: int, target: str) -> Subscription | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM subscriptions WHERE id = ? AND target = ?",
+                (subscription_id, target),
+            ).fetchone()
+            return self._from_row(row) if row is not None else None
+
+    def update_subscription(self, subscription: Subscription) -> Subscription | None:
+        if subscription.id is None:
+            raise ValueError("Saved subscription ID is required")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE subscriptions SET
+                    repository = ?, digest_path = ?, ref = ?, token_env = ?,
+                    timezone = ?, send_time = ?
+                WHERE id = ? AND target = ?
+                """,
+                (
+                    subscription.repository,
+                    subscription.digest_path,
+                    subscription.ref,
+                    subscription.token_env,
+                    subscription.timezone,
+                    subscription.send_time,
+                    subscription.id,
+                    subscription.target,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT * FROM subscriptions WHERE id = ? AND target = ?",
+                (subscription.id, subscription.target),
+            ).fetchone()
+            return self._from_row(row)
+
     def delete_subscription(self, subscription_id: int, target: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(

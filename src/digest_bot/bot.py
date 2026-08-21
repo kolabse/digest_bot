@@ -26,10 +26,42 @@ from .storage import Storage
 LOGGER = logging.getLogger(__name__)
 CHANNEL, REPOSITORY, PATH, REF, TOKEN_ENV, TIMEZONE, SEND_TIME, CONFIRM = range(8)
 TOKEN_ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+KEEP_VALUE = "Оставить без изменений"
 
 
 def _storage(context: ContextTypes.DEFAULT_TYPE) -> Storage:
     return context.application.bot_data["storage"]
+
+
+def _is_editing(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return "original" in context.user_data.get("setup", {})
+
+
+def _step_markup(
+    context: ContextTypes.DEFAULT_TYPE, *choices: str
+) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
+    rows = [[KEEP_VALUE]] if _is_editing(context) else []
+    rows.extend([[choice] for choice in choices])
+    return (
+        ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
+        if rows
+        else ReplyKeyboardRemove()
+    )
+
+
+def _current_value(context: ContextTypes.DEFAULT_TYPE, key: str) -> str:
+    if not _is_editing(context):
+        return ""
+    value = context.user_data["setup"][key]
+    displayed = value if value is not None else "публичный доступ"
+    return f"\n\nТекущее значение: {displayed}"
+
+
+def _entered_value(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> Any:
+    text = update.effective_message.text.strip()
+    if _is_editing(context) and text == KEEP_VALUE:
+        return context.user_data["setup"][key]
+    return text
 
 
 async def _authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -55,13 +87,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Я отправляю ежедневный дайджест проекта из GitHub или GitLab по расписанию.\n\n"
         "Настройте рассылку командой /setup. В личном диалоге адресатом будете вы; "
-        "в группе — текущая группа. Команда /help покажет остальные возможности."
+        "в группе — текущая группа. Изменить сохранённую рассылку можно командой "
+        "/edit ID. Команда /help покажет остальные возможности."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "/setup — добавить рассылку\n"
+        "/edit ID — изменить рассылку\n"
         "/list — показать рассылки текущего чата\n"
         "/preview ID — показать сообщение за подходящую дату\n"
         "/delete ID — удалить рассылку\n"
@@ -85,6 +119,36 @@ async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return CHANNEL
 
 
+async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _authorized(update, context):
+        return ConversationHandler.END
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Использование: /edit ID")
+        return ConversationHandler.END
+    target = str(update.effective_chat.id)
+    subscription = _storage(context).get_subscription(int(context.args[0]), target)
+    if subscription is None:
+        await update.effective_message.reply_text("Рассылка не найдена.")
+        return ConversationHandler.END
+    context.user_data["setup"] = {
+        "channel": subscription.channel,
+        "repository": subscription.repository,
+        "digest_path": subscription.digest_path,
+        "ref": subscription.ref,
+        "token_env": subscription.token_env,
+        "timezone": subscription.timezone,
+        "send_time": subscription.send_time,
+        "original": subscription,
+    }
+    await update.effective_message.reply_text(
+        "Укажите новый репозиторий: GitHub owner/name либо полный HTTPS URL "
+        "GitHub/GitLab."
+        + _current_value(context, "repository"),
+        reply_markup=_step_markup(context),
+    )
+    return REPOSITORY
+
+
 async def channel_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_message.text.casefold() != "telegram":
         await update.effective_message.reply_text(
@@ -103,7 +167,7 @@ async def repository_step(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         settings: Settings = context.application.bot_data["settings"]
         repository = normalize_repository(
-            update.effective_message.text, settings.gitlab_allowed_hosts
+            _entered_value(update, context, "repository"), settings.gitlab_allowed_hosts
         )
     except ValueError as exc:
         await update.effective_message.reply_text(str(exc))
@@ -113,26 +177,29 @@ async def repository_step(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "Укажите путь к дайджесту внутри репозитория.\n\n"
         "Пример:\n"
         "docs/project-digest.md"
+        + _current_value(context, "digest_path"),
+        reply_markup=_step_markup(context),
     )
     return PATH
 
 
 async def path_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        digest_path = normalize_digest_path(update.effective_message.text)
+        digest_path = normalize_digest_path(_entered_value(update, context, "digest_path"))
     except ValueError as exc:
         await update.effective_message.reply_text(str(exc))
         return PATH
     context.user_data["setup"]["digest_path"] = digest_path
     await update.effective_message.reply_text(
-        "Выберите ветку main или введите другой Git ref.",
-        reply_markup=ReplyKeyboardMarkup([["main"]], one_time_keyboard=True, resize_keyboard=True),
+        "Выберите ветку main или введите другой Git ref."
+        + _current_value(context, "ref"),
+        reply_markup=_step_markup(context, "main"),
     )
     return REF
 
 
 async def ref_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    ref = update.effective_message.text.strip()
+    ref = _entered_value(update, context, "ref")
     if ref == "-":
         ref = "main"
     if not ref or any(character.isspace() for character in ref):
@@ -145,19 +212,20 @@ async def ref_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     suggested_token = "GITLAB_TOKEN" if "://" in repository else "GITHUB_TOKEN"
     await update.effective_message.reply_text(
         "Если репозиторий приватный, укажите имя переменной окружения с токеном "
-        "или выберите предложенный вариант. Сам токен в Telegram не отправляйте.",
-        reply_markup=ReplyKeyboardMarkup(
-            [[suggested_token], ["Публичный репозиторий"]],
-            one_time_keyboard=True,
-            resize_keyboard=True,
-        ),
+        "или выберите предложенный вариант. Сам токен в Telegram не отправляйте."
+        + _current_value(context, "token_env"),
+        reply_markup=_step_markup(context, suggested_token, "Публичный репозиторий"),
     )
     return TOKEN_ENV
 
 
 async def token_env_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    value = update.effective_message.text.strip()
-    token_env = None if value in {"-", "Публичный репозиторий"} else value
+    value = _entered_value(update, context, "token_env")
+    if value is None:
+        token_env = None
+    else:
+        value = value.strip()
+        token_env = None if value in {"-", "Публичный репозиторий"} else value
     if token_env and not TOKEN_ENV_PATTERN.fullmatch(token_env):
         await update.effective_message.reply_text("Это не похоже на имя переменной окружения.")
         return TOKEN_ENV
@@ -165,17 +233,16 @@ async def token_env_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     settings: Settings = context.application.bot_data["settings"]
     await update.effective_message.reply_text(
         "Выберите часовой пояс по умолчанию или введите другое имя IANA, "
-        "например Europe/Moscow.",
-        reply_markup=ReplyKeyboardMarkup(
-            [[settings.default_timezone]], one_time_keyboard=True, resize_keyboard=True
-        ),
+        "например Europe/Moscow."
+        + _current_value(context, "timezone"),
+        reply_markup=_step_markup(context, settings.default_timezone),
     )
     return TIMEZONE
 
 
 async def timezone_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     settings: Settings = context.application.bot_data["settings"]
-    value = update.effective_message.text.strip()
+    value = _entered_value(update, context, "timezone")
     if value == "-":
         value = settings.default_timezone
     try:
@@ -187,15 +254,16 @@ async def timezone_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await update.effective_message.reply_text(
         "Укажите время отправки ЧЧ:ММ. Доступно 00:00–13:59 (за вчера) или "
         "20:00–23:59 (за сегодня); с 14:00 до 20:00 рассылка не выполняется.\n\n"
-        "Команда /preview сможет проверить сообщение в любое время.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Команда /preview сможет проверить сообщение в любое время."
+        + _current_value(context, "send_time"),
+        reply_markup=_step_markup(context),
     )
     return SEND_TIME
 
 
 async def send_time_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        send_time = validate_send_time(update.effective_message.text)
+        send_time = validate_send_time(_entered_value(update, context, "send_time"))
     except InvalidSchedule as exc:
         await update.effective_message.reply_text(str(exc))
         return SEND_TIME
@@ -230,23 +298,47 @@ async def confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return ConversationHandler.END
     setup = context.user_data.pop("setup")
-    saved = _storage(context).add_subscription(
-        Subscription(
-            id=None,
-            channel=setup["channel"],
-            target=str(update.effective_chat.id),
-            repository=setup["repository"],
-            digest_path=setup["digest_path"],
-            ref=setup["ref"],
-            token_env=setup["token_env"],
-            timezone=setup["timezone"],
-            send_time=setup["send_time"],
-            created_by=update.effective_user.id,
+    original: Subscription | None = setup.get("original")
+    if original is None:
+        saved = _storage(context).add_subscription(
+            Subscription(
+                id=None,
+                channel=setup["channel"],
+                target=str(update.effective_chat.id),
+                repository=setup["repository"],
+                digest_path=setup["digest_path"],
+                ref=setup["ref"],
+                token_env=setup["token_env"],
+                timezone=setup["timezone"],
+                send_time=setup["send_time"],
+                created_by=update.effective_user.id,
+            )
         )
-    )
+        result = f"Рассылка #{saved.id} сохранена."
+    else:
+        saved = _storage(context).update_subscription(
+            Subscription(
+                id=original.id,
+                channel=original.channel,
+                target=original.target,
+                repository=setup["repository"],
+                digest_path=setup["digest_path"],
+                ref=setup["ref"],
+                token_env=setup["token_env"],
+                timezone=setup["timezone"],
+                send_time=setup["send_time"],
+                created_by=original.created_by,
+                active=original.active,
+            )
+        )
+        if saved is None:
+            await update.effective_message.reply_text(
+                "Рассылка больше не найдена.", reply_markup=ReplyKeyboardRemove()
+            )
+            return ConversationHandler.END
+        result = f"Рассылка #{saved.id} обновлена."
     await update.effective_message.reply_text(
-        f"Рассылка #{saved.id} сохранена. Проверить источник можно командой "
-        f"/preview {saved.id}.",
+        f"{result} Проверить источник можно командой /preview {saved.id}.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
@@ -332,6 +424,7 @@ def build_application(settings: Settings) -> Application:
         await application.bot.set_my_commands(
             [
                 BotCommand("setup", "добавить рассылку"),
+                BotCommand("edit", "изменить рассылку"),
                 BotCommand("list", "показать рассылки"),
                 BotCommand("preview", "проверить сообщение"),
                 BotCommand("delete", "удалить рассылку"),
@@ -362,7 +455,10 @@ def build_application(settings: Settings) -> Application:
         .build()
     )
     conversation = ConversationHandler(
-        entry_points=[CommandHandler("setup", setup_start)],
+        entry_points=[
+            CommandHandler("setup", setup_start),
+            CommandHandler("edit", edit_start),
+        ],
         states={
             CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, channel_step)],
             REPOSITORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, repository_step)],
