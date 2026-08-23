@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "behavior": "Версионированная и атомарная инициализация SQLite обновляет точную базу v0.1.0 без потери данных и отклоняет неизвестные схемы.",
+  "subject": {
+    "kind": "worktree",
+    "identity": "sha256:3b68d9559f594e26584074817c1cfafa134e503711ed85d3f8251f8925eea84c"
+  },
+  "red": {
+    "command": [
+      "python",
+      "-m",
+      "pytest",
+      "tests/test_storage.py::test_initialization_versions_legacy_database_without_losing_data",
+      "-q"
+    ],
+    "exit_code": 1,
+    "summary": "Тест завершился с 1 failure: после initialize() PRAGMA user_version оставался равен 0 вместо 1.",
+    "failure_class": "intended_behavior",
+    "intended_behavior_failure_reason": "Сбой непосредственно подтвердил отсутствие версионирования существующей базы v0.1.0 при сохранённых данных."
+  },
+  "green": {
+    "focused": {
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "tests/test_storage.py",
+        "-q"
+      ],
+      "exit_code": 0,
+      "summary": "12 storage tests passed, включая legacy upgrade, идемпотентность, строгую проверку схемы и rollback."
+    },
+    "broader": {
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "exit_code": 0,
+      "summary": "51 project tests passed."
+    }
+  },
+  "evidence_digest": "sha256:6f82de27a8e200f73dba57ef19379edc59bb16b8ed753ac674e2642beca3c597"
+}
