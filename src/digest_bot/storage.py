@@ -6,33 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .migrations import migrate
 from .models import Subscription
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS subscriptions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel TEXT NOT NULL,
-    target TEXT NOT NULL,
-    repository TEXT NOT NULL,
-    digest_path TEXT NOT NULL,
-    ref TEXT NOT NULL,
-    token_env TEXT,
-    timezone TEXT NOT NULL,
-    send_time TEXT NOT NULL,
-    created_by INTEGER NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS deliveries (
-    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
-    digest_date TEXT NOT NULL,
-    status TEXT NOT NULL,
-    attempted_at TEXT NOT NULL,
-    sent_at TEXT,
-    error TEXT,
-    PRIMARY KEY (subscription_id, digest_date)
-);
-"""
 
 
 class Storage:
@@ -52,8 +27,11 @@ class Storage:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.executescript(SCHEMA)
+        connection = sqlite3.connect(self.path, timeout=10)
+        try:
+            migrate(connection)
+        finally:
+            connection.close()
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> Subscription:
