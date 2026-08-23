@@ -100,6 +100,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/pause ID — приостановить рассылку\n"
         "/resume ID — возобновить рассылку\n"
         "/preview ID — показать сообщение за подходящую дату\n"
+        "/stats [ID] — показать статистику доставок\n"
         "/delete ID — удалить рассылку\n"
         "/cancel — отменить текущую настройку\n\n"
         "Допустимое время: 00:00–13:59 (дайджест за вчера) или "
@@ -370,6 +371,51 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text("Рассылки:\n" + "\n".join(lines))
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context):
+        return
+    if len(context.args) > 1 or (context.args and not context.args[0].isdigit()):
+        await update.effective_message.reply_text("Использование: /stats [ID]")
+        return
+    subscription_id = int(context.args[0]) if context.args else None
+    stats = _storage(context).delivery_stats(
+        str(update.effective_chat.id),
+        subscription_id,
+    )
+    if stats is None:
+        await update.effective_message.reply_text("Рассылка не найдена.")
+        return
+    title = (
+        f"Статистика рассылки #{subscription_id}:"
+        if subscription_id is not None
+        else "Статистика доставок:"
+    )
+    if stats.total == 0:
+        await update.effective_message.reply_text(
+            f"{title}\nДля {'этой рассылки' if subscription_id else 'этого чата'} "
+            "пока нет доставок."
+        )
+        return
+    lines = [
+        title,
+        f"Всего: {stats.total} · успешно: {stats.sent} · провалено: {stats.failed}",
+        f"Ожидают повтора: {stats.retrying} · выполняются: {stats.sending}",
+        f"Попыток доставки: {stats.attempts}",
+    ]
+    if subscription_id is not None and stats.latest is not None:
+        status_names = {
+            "sent": "успешно",
+            "failed": "провалено",
+            "retrying": "ожидает повтора",
+            "sending": "выполняется",
+        }
+        lines.append(
+            f"Последняя доставка: {stats.latest.digest_date} — "
+            f"{status_names[stats.latest.status]}, попыток: {stats.latest.attempt_count}."
+        )
+    await update.effective_message.reply_text("\n".join(lines))
+
+
 async def _set_subscription_active(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -459,6 +505,8 @@ def build_application(settings: Settings) -> Application:
                 max_delay_seconds=settings.delivery_retry_max_seconds,
                 claim_lease_seconds=settings.delivery_claim_lease_seconds,
             ),
+            history_retention_days=settings.delivery_history_retention_days,
+            cleanup_batch_size=settings.delivery_cleanup_batch_size,
         )
         application.bot_data.update(
             {"settings": settings, "storage": storage, "source": source, "service": service}
@@ -471,6 +519,7 @@ def build_application(settings: Settings) -> Application:
                 BotCommand("pause", "приостановить рассылку"),
                 BotCommand("resume", "возобновить рассылку"),
                 BotCommand("preview", "проверить сообщение"),
+                BotCommand("stats", "статистика доставок"),
                 BotCommand("delete", "удалить рассылку"),
                 BotCommand("help", "помощь"),
             ]
@@ -524,5 +573,6 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("preview", preview_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     application.add_error_handler(error_handler)
     return application

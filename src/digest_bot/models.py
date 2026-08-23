@@ -46,3 +46,26 @@ class DeliveryRecord:
     claim_token: str | None
     window_end_at: str
     lease_expires_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryStats:
+    total: int
+    sent: int
+    failed: int
+    retrying: int
+    sending: int
+    attempts: int
+    latest: DeliveryRecord | None
+
+
+@dataclass(frozen=True, slots=True)
+class FailureNotificationClaim:
+    subscription_id: int
+    digest_date: str
+    channel: str
+    target: str
+    reason: str
+    delivery_attempt_count: int
+    attempt_count: int
+    token: str

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ from digest_bot.bot import (
     repository_step,
     resume_command,
     send_time_step,
+    stats_command,
     timezone_step,
     token_env_step,
 )
@@ -224,6 +226,40 @@ async def test_list_shows_active_and_paused_statuses(tmp_path) -> None:
     response = update.effective_message.replies[-1][0]
     assert f"#{active.id} · активна ·" in response
     assert f"#{paused.id} · приостановлена ·" in response
+
+
+async def test_stats_is_scoped_to_current_chat(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    claim = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert claim is not None
+    assert storage.complete_delivery(claim, now)
+    update = make_update()
+
+    await stats_command(update, make_context(storage, str(saved.id)))
+
+    response = update.effective_message.replies[-1][0]
+    assert "Статистика рассылки #1" in response
+    assert "успешно: 1" in response
+    assert "Попыток доставки: 1" in response
+
+    update.effective_chat.id = 999
+    await stats_command(update, make_context(storage, str(saved.id)))
+    assert update.effective_message.replies[-1][0] == "Рассылка не найдена."
+
+
+@pytest.mark.parametrize("args", [("bad",), ("1", "2")])
+async def test_stats_rejects_invalid_arguments(tmp_path, args) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    update = make_update()
+
+    await stats_command(update, make_context(storage, *args))
+
+    assert update.effective_message.replies[-1][0] == "Использование: /stats [ID]"
 
 
 async def test_pause_requires_configured_admin_access(tmp_path) -> None:

@@ -80,6 +80,53 @@ CREATE INDEX deliveries_retry_due_idx
 ON deliveries (status, next_attempt_at, window_end_at, lease_expires_at)
 """
 
+DELIVERIES_RETENTION_INDEX = """
+CREATE INDEX deliveries_retention_idx
+ON deliveries (status, sent_at, failed_at)
+"""
+
+FAILURE_NOTIFICATIONS_SCHEMA = """
+CREATE TABLE delivery_failure_notifications (
+    subscription_id INTEGER NOT NULL,
+    digest_date TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    target TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    delivery_attempt_count INTEGER NOT NULL CHECK (delivery_attempt_count >= 1),
+    status TEXT NOT NULL CHECK (
+        status IN ('pending', 'sending', 'retrying', 'sent', 'abandoned')
+    ),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_at TEXT,
+    claim_token TEXT,
+    lease_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    error TEXT,
+    PRIMARY KEY (subscription_id, digest_date),
+    FOREIGN KEY (subscription_id, digest_date)
+        REFERENCES deliveries(subscription_id, digest_date) ON DELETE CASCADE,
+    CHECK (
+        (status = 'pending' AND attempt_count = 0 AND next_attempt_at IS NULL
+            AND claim_token IS NULL AND lease_expires_at IS NULL AND sent_at IS NULL)
+        OR (status = 'sending' AND attempt_count >= 1 AND next_attempt_at IS NULL
+            AND claim_token IS NOT NULL AND lease_expires_at IS NOT NULL
+            AND sent_at IS NULL)
+        OR (status = 'retrying' AND attempt_count >= 1 AND next_attempt_at IS NOT NULL
+            AND claim_token IS NULL AND lease_expires_at IS NULL AND sent_at IS NULL)
+        OR (status = 'sent' AND attempt_count >= 1 AND next_attempt_at IS NULL
+            AND claim_token IS NULL AND lease_expires_at IS NULL AND sent_at IS NOT NULL)
+        OR (status = 'abandoned' AND attempt_count >= 1 AND next_attempt_at IS NULL
+            AND claim_token IS NULL AND lease_expires_at IS NULL AND sent_at IS NULL)
+    )
+)
+"""
+
+FAILURE_NOTIFICATIONS_DUE_INDEX = """
+CREATE INDEX delivery_failure_notifications_due_idx
+ON delivery_failure_notifications (status, next_attempt_at, lease_expires_at)
+"""
+
 def _normalize_schema_sql(value: str) -> str:
     return " ".join(value.split()).casefold()
 
@@ -94,6 +141,22 @@ _EXPECTED_SCHEMAS = {
         ("table", "deliveries"): _normalize_schema_sql(DELIVERIES_SCHEMA),
         ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(
             DELIVERIES_RETRY_INDEX
+        ),
+    },
+    3: {
+        ("table", "subscriptions"): _normalize_schema_sql(SUBSCRIPTIONS_SCHEMA),
+        ("table", "deliveries"): _normalize_schema_sql(DELIVERIES_SCHEMA),
+        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(
+            DELIVERIES_RETRY_INDEX
+        ),
+        ("index", "deliveries_retention_idx"): _normalize_schema_sql(
+            DELIVERIES_RETENTION_INDEX
+        ),
+        ("table", "delivery_failure_notifications"): _normalize_schema_sql(
+            FAILURE_NOTIFICATIONS_SCHEMA
+        ),
+        ("index", "delivery_failure_notifications_due_idx"): _normalize_schema_sql(
+            FAILURE_NOTIFICATIONS_DUE_INDEX
         ),
     },
 }
@@ -171,9 +234,17 @@ def _migrate_to_version_2(connection: sqlite3.Connection) -> None:
     connection.execute(DELIVERIES_RETRY_INDEX)
 
 
+def _migrate_to_version_3(connection: sqlite3.Connection) -> None:
+    _validate_schema(connection, 2, "version 2")
+    connection.execute(DELIVERIES_RETENTION_INDEX)
+    connection.execute(FAILURE_NOTIFICATIONS_SCHEMA)
+    connection.execute(FAILURE_NOTIFICATIONS_DUE_INDEX)
+
+
 MIGRATIONS: dict[int, Migration] = {
     1: _migrate_to_version_1,
     2: _migrate_to_version_2,
+    3: _migrate_to_version_3,
 }
 LATEST_SCHEMA_VERSION = max(MIGRATIONS)
 

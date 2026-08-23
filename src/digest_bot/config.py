@@ -47,6 +47,8 @@ class Settings:
     delivery_retry_initial_seconds: int = 60
     delivery_retry_max_seconds: int = 3600
     delivery_claim_lease_seconds: int = 3600
+    delivery_history_retention_days: int = 90
+    delivery_cleanup_batch_size: int = 500
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -58,6 +60,8 @@ class Settings:
         retry_initial = _parse_int("DELIVERY_RETRY_INITIAL_SECONDS", 60, minimum=1)
         retry_max = _parse_int("DELIVERY_RETRY_MAX_SECONDS", 3600, minimum=1)
         claim_lease = _parse_int("DELIVERY_CLAIM_LEASE_SECONDS", 3600, minimum=60)
+        retention_days = _parse_int("DELIVERY_HISTORY_RETENTION_DAYS", 90, minimum=1)
+        cleanup_batch_size = _parse_int("DELIVERY_CLEANUP_BATCH_SIZE", 500, minimum=1)
         if retry_max < retry_initial:
             raise ConfigurationError(
                 "DELIVERY_RETRY_MAX_SECONDS must be greater than or equal to "
@@ -75,4 +79,6 @@ class Settings:
             delivery_retry_initial_seconds=retry_initial,
             delivery_retry_max_seconds=retry_max,
             delivery_claim_lease_seconds=claim_lease,
+            delivery_history_retention_days=retention_days,
+            delivery_cleanup_batch_size=cleanup_batch_size,
         )
