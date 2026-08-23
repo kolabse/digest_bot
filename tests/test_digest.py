@@ -171,6 +171,11 @@ def test_escapes_raw_html() -> None:
 def test_render_message_wraps_intro_and_outro(monkeypatch) -> None:
     monkeypatch.setattr(
         digest_module,
+        "choose_intro_variant",
+        lambda *, digest_is_today: "Сегодня в проекте появились изменения.",
+    )
+    monkeypatch.setattr(
+        digest_module,
         "choose_outro_variant",
         lambda *, item_count, digest_is_today: "Работа продолжается.",
     )
@@ -179,6 +184,6 @@ def test_render_message_wraps_intro_and_outro(monkeypatch) -> None:
         digest_is_today=True,
     )
     assert message.startswith("<b>")
-    assert "сегодня" in message
+    assert "сегодня" in message.lower()
     assert "<i>Дайджест за 20.08.2026</i>" in message
     assert message.endswith("<i>Работа продолжается.</i>")

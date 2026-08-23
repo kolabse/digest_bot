@@ -1,19 +1,64 @@
 from __future__ import annotations
 
+import math
 import os
 import re
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlparse
 
 import httpx
 
+from .errors import DeliveryOperationError
+
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-class RepositorySourceError(RuntimeError):
-    pass
+class RepositorySourceError(DeliveryOperationError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            retryable=retryable,
+            retry_after_seconds=retry_after_seconds,
+        )
 
 
 GitHubSourceError = RepositorySourceError
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    value = response.headers.get("Retry-After", "").strip()
+    try:
+        seconds = float(value) if value else None
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = (retry_at - datetime.now(UTC)).total_seconds()
+    if seconds is None or not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return seconds
+
+
+def _raise_for_api_status(response: httpx.Response, provider: str) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        retryable = response.status_code in {408, 425, 429} or response.status_code >= 500
+        raise RepositorySourceError(
+            f"{provider} API вернул HTTP {response.status_code}.",
+            retryable=retryable,
+            retry_after_seconds=_retry_after_seconds(response) if retryable else None,
+        ) from exc
 
 
 def normalize_repository(
@@ -86,26 +131,35 @@ class RepositoryContentsSource:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        response = await self._client.get(
-            f"https://api.github.com/repos/{repository}/contents/{encoded_path}",
-            params={"ref": ref},
-            headers=headers,
-        )
+        try:
+            response = await self._client.get(
+                f"https://api.github.com/repos/{repository}/contents/{encoded_path}",
+                params={"ref": ref},
+                headers=headers,
+            )
+        except httpx.TransportError as exc:
+            raise RepositorySourceError(
+                "Не удалось подключиться к GitHub API.", retryable=True
+            ) from exc
         if response.status_code == 404:
             raise RepositorySourceError(
                 "Репозиторий или файл не найден. Для приватного репозитория "
                 "проверьте токен и его права."
             )
+        if response.status_code == 403 and (
+            response.headers.get("X-RateLimit-Remaining") == "0"
+            or response.headers.get("Retry-After")
+        ):
+            raise RepositorySourceError(
+                "GitHub временно ограничил частоту запросов.",
+                retryable=True,
+                retry_after_seconds=_retry_after_seconds(response),
+            )
         if response.status_code in {401, 403}:
             raise RepositorySourceError(
                 "GitHub отклонил доступ. Проверьте токен и лимиты API."
             )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RepositorySourceError(
-                f"GitHub API вернул HTTP {response.status_code}."
-            ) from exc
+        _raise_for_api_status(response, "GitHub")
         return response.text
 
     async def _read_gitlab(
@@ -120,12 +174,17 @@ class RepositoryContentsSource:
         headers = {"User-Agent": "project-digest-bot"}
         if token:
             headers["PRIVATE-TOKEN"] = token
-        response = await self._client.get(
-            f"{parsed.scheme}://{parsed.netloc}/api/v4/projects/{project}/repository/files/"
-            f"{file_path}/raw",
-            params={"ref": ref},
-            headers=headers,
-        )
+        try:
+            response = await self._client.get(
+                f"{parsed.scheme}://{parsed.netloc}/api/v4/projects/{project}/repository/files/"
+                f"{file_path}/raw",
+                params={"ref": ref},
+                headers=headers,
+            )
+        except httpx.TransportError as exc:
+            raise RepositorySourceError(
+                "Не удалось подключиться к GitLab API.", retryable=True
+            ) from exc
         if response.status_code == 404:
             raise RepositorySourceError(
                 "Проект или файл GitLab не найден. Для приватного проекта проверьте "
@@ -135,12 +194,7 @@ class RepositoryContentsSource:
             raise RepositorySourceError(
                 "GitLab отклонил доступ. Токену нужен read_repository или read_api."
             )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RepositorySourceError(
-                f"GitLab API вернул HTTP {response.status_code}."
-            ) from exc
+        _raise_for_api_status(response, "GitLab")
         return response.text
 
 

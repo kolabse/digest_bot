@@ -20,7 +20,7 @@ from .config import Settings
 from .github import RepositoryContentsSource, normalize_digest_path, normalize_repository
 from .models import Subscription
 from .schedule import InvalidSchedule, validate_send_time, validate_timezone
-from .service import DeliveryService
+from .service import DeliveryService, RetryPolicy
 from .storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -453,6 +453,12 @@ def build_application(settings: Settings) -> Application:
             storage=storage,
             source=source,
             channels={"telegram": TelegramChannel(application.bot)},
+            retry_policy=RetryPolicy(
+                max_attempts=settings.delivery_max_attempts,
+                initial_delay_seconds=settings.delivery_retry_initial_seconds,
+                max_delay_seconds=settings.delivery_retry_max_seconds,
+                claim_lease_seconds=settings.delivery_claim_lease_seconds,
+            ),
         )
         application.bot_data.update(
             {"settings": settings, "storage": storage, "source": source, "service": service}

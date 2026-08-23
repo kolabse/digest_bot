@@ -69,6 +69,7 @@ def digest_date_for_send_time(local_date: date, send_time: str) -> date:
 class DueDelivery:
     digest_date: date
     local_now: datetime
+    window_end: datetime
 
 
 def due_delivery(timezone: str, send_time: str, now: datetime) -> DueDelivery | None:
@@ -83,4 +84,17 @@ def due_delivery(timezone: str, send_time: str, now: datetime) -> DueDelivery | 
     )
     if not same_window or current < scheduled:
         return None
-    return DueDelivery(digest_date=digest_date, local_now=local_now)
+    if current < MORNING_END:
+        window_end = local_now.replace(hour=14, minute=0, second=0, microsecond=0)
+    else:
+        window_end = (local_now + timedelta(days=1)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    return DueDelivery(
+        digest_date=digest_date,
+        local_now=local_now,
+        window_end=window_end,
+    )

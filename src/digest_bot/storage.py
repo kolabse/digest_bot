@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from .migrations import migrate
-from .models import Subscription
+from .models import DeliveryClaim, DeliveryRecord, Subscription
 
 
 class Storage:
@@ -162,45 +163,197 @@ class Storage:
             )
             return cursor.rowcount > 0
 
-    def claim_delivery(self, subscription_id: int, digest_date: str, now: datetime) -> bool:
+    @staticmethod
+    def _delivery_from_row(row: sqlite3.Row) -> DeliveryRecord:
+        return DeliveryRecord(
+            subscription_id=row["subscription_id"],
+            digest_date=row["digest_date"],
+            status=row["status"],
+            attempt_count=row["attempt_count"],
+            attempted_at=row["attempted_at"],
+            next_attempt_at=row["next_attempt_at"],
+            sent_at=row["sent_at"],
+            failed_at=row["failed_at"],
+            error=row["error"],
+            claim_token=row["claim_token"],
+            window_end_at=row["window_end_at"],
+            lease_expires_at=row["lease_expires_at"],
+        )
+
+    def get_delivery(self, subscription_id: int, digest_date: str) -> DeliveryRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM deliveries
+                WHERE subscription_id = ? AND digest_date = ?
+                """,
+                (subscription_id, digest_date),
+            ).fetchone()
+            return self._delivery_from_row(row) if row is not None else None
+
+    def claim_delivery(
+        self,
+        subscription_id: int,
+        digest_date: str,
+        now: datetime,
+        *,
+        max_attempts: int = 5,
+        stale_after: timedelta = timedelta(minutes=10),
+        window_end: datetime | None = None,
+    ) -> DeliveryClaim | None:
+        token = uuid.uuid4().hex
+        attempted_at = now.isoformat()
+        lease_expires_at = (now + stale_after).isoformat()
+        window_end_at = (window_end or now + timedelta(days=1)).isoformat()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO deliveries (subscription_id, digest_date, status, attempted_at)
-                VALUES (?, ?, 'sending', ?)
+                INSERT INTO deliveries (
+                    subscription_id, digest_date, status, attempted_at,
+                    attempt_count, next_attempt_at, claim_token,
+                    window_end_at, lease_expires_at
+                )
+                VALUES (?, ?, 'sending', ?, 1, NULL, ?, ?, ?)
                 ON CONFLICT (subscription_id, digest_date) DO NOTHING
                 """,
-                (subscription_id, digest_date, now.isoformat()),
+                (
+                    subscription_id,
+                    digest_date,
+                    attempted_at,
+                    token,
+                    window_end_at,
+                    lease_expires_at,
+                ),
             )
             if cursor.rowcount > 0:
-                return True
+                return DeliveryClaim(subscription_id, digest_date, 1, token)
 
-            # Recover a claim left behind when the process stopped during delivery.
-            stale_before = (now - timedelta(minutes=10)).isoformat()
+            connection.execute(
+                """
+                UPDATE deliveries SET
+                    status = 'failed', failed_at = ?, next_attempt_at = NULL,
+                    claim_token = NULL, lease_expires_at = NULL,
+                    error = COALESCE(error, 'Delivery attempt lease expired')
+                WHERE subscription_id = ? AND digest_date = ?
+                  AND attempt_count >= ?
+                  AND (
+                    (status = 'retrying' AND next_attempt_at <= ?)
+                    OR (status = 'sending' AND lease_expires_at <= ?)
+                  )
+                """,
+                (
+                    attempted_at,
+                    subscription_id,
+                    digest_date,
+                    max_attempts,
+                    attempted_at,
+                    attempted_at,
+                ),
+            )
             cursor = connection.execute(
                 """
-                UPDATE deliveries SET attempted_at = ?
+                UPDATE deliveries SET
+                    status = 'sending', attempted_at = ?, attempt_count = attempt_count + 1,
+                    next_attempt_at = NULL, claim_token = ?, lease_expires_at = ?
                 WHERE subscription_id = ? AND digest_date = ?
-                  AND status = 'sending' AND attempted_at <= ?
+                  AND attempt_count < ?
+                  AND (
+                    (status = 'retrying' AND next_attempt_at <= ?)
+                    OR (status = 'sending' AND lease_expires_at <= ?)
+                  )
+                  AND window_end_at > ?
                 """,
-                (now.isoformat(), subscription_id, digest_date, stale_before),
+                (
+                    attempted_at,
+                    token,
+                    lease_expires_at,
+                    subscription_id,
+                    digest_date,
+                    max_attempts,
+                    attempted_at,
+                    attempted_at,
+                    attempted_at,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute(
+                """
+                SELECT attempt_count FROM deliveries
+                WHERE subscription_id = ? AND digest_date = ? AND claim_token = ?
+                """,
+                (subscription_id, digest_date, token),
+            ).fetchone()
+            if row is None:
+                return None
+            return DeliveryClaim(subscription_id, digest_date, int(row[0]), token)
+
+    def complete_delivery(self, claim: DeliveryClaim, now: datetime) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deliveries SET
+                    status = 'sent', sent_at = ?, error = NULL,
+                    next_attempt_at = NULL, failed_at = NULL, claim_token = NULL,
+                    lease_expires_at = NULL
+                WHERE subscription_id = ? AND digest_date = ?
+                  AND status = 'sending' AND claim_token = ?
+                """,
+                (
+                    now.isoformat(),
+                    claim.subscription_id,
+                    claim.digest_date,
+                    claim.token,
+                ),
             )
             return cursor.rowcount > 0
 
-    def complete_delivery(self, subscription_id: int, digest_date: str, now: datetime) -> None:
+    def fail_delivery(
+        self,
+        claim: DeliveryClaim,
+        now: datetime,
+        error: str,
+        *,
+        next_attempt_at: datetime | None,
+    ) -> bool:
+        status = "retrying" if next_attempt_at is not None else "failed"
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
-                UPDATE deliveries SET status = 'sent', sent_at = ?, error = NULL
+                UPDATE deliveries SET
+                    status = ?, error = ?, next_attempt_at = ?, failed_at = ?,
+                    claim_token = NULL, lease_expires_at = NULL
                 WHERE subscription_id = ? AND digest_date = ?
+                  AND status = 'sending' AND claim_token = ?
                 """,
-                (now.isoformat(), subscription_id, digest_date),
+                (
+                    status,
+                    error[:2000],
+                    next_attempt_at.isoformat() if next_attempt_at is not None else None,
+                    now.isoformat() if next_attempt_at is None else None,
+                    claim.subscription_id,
+                    claim.digest_date,
+                    claim.token,
+                ),
             )
+            return cursor.rowcount > 0
 
-    def release_delivery(self, subscription_id: int, digest_date: str, error: str) -> None:
-        # A failed claim is removed so the next scheduler pass can retry.
+    def expire_open_deliveries(self, now: datetime) -> int:
         with self._connect() as connection:
-            connection.execute(
-                "DELETE FROM deliveries WHERE subscription_id = ? AND digest_date = ?",
-                (subscription_id, digest_date),
+            cursor = connection.execute(
+                """
+                UPDATE deliveries SET
+                    status = 'failed', failed_at = ?, next_attempt_at = NULL,
+                    claim_token = NULL, lease_expires_at = NULL,
+                    error = COALESCE(error, 'Delivery window expired')
+                WHERE (status = 'retrying' AND window_end_at <= ?)
+                   OR (status = 'sending' AND window_end_at <= ? AND lease_expires_at <= ?)
+                """,
+                (
+                    now.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
             )
+            return cursor.rowcount

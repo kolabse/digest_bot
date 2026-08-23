@@ -100,8 +100,11 @@ def test_initialization_versions_legacy_database_without_losing_data(tmp_path) -
             LATEST_SCHEMA_VERSION
         )
         assert connection.execute(
-            "SELECT status, error FROM deliveries WHERE subscription_id = 1"
-        ).fetchone() == ("sent", None)
+            """
+            SELECT status, error, attempt_count, next_attempt_at, claim_token
+            FROM deliveries WHERE subscription_id = 1
+            """
+        ).fetchone() == ("sent", None, 1, None, None)
     assert not storage.claim_delivery(
         1,
         "2026-08-19",
@@ -181,7 +184,10 @@ def test_initialization_validates_current_schema(tmp_path) -> None:
         connection.execute("CREATE TABLE subscriptions (id INTEGER PRIMARY KEY)")
         connection.execute(f"PRAGMA user_version = {LATEST_SCHEMA_VERSION}")
 
-    with pytest.raises(SchemaMigrationError, match="version 1 schema"):
+    with pytest.raises(
+        SchemaMigrationError,
+        match=rf"version {LATEST_SCHEMA_VERSION} schema",
+    ):
         Storage(database_path).initialize()
 
 
@@ -254,9 +260,10 @@ def test_storage_crud_and_delivery_claim(tmp_path) -> None:
     assert storage.list_subscriptions(target="123") == [saved]
 
     now = datetime(2026, 8, 20, tzinfo=UTC)
-    assert storage.claim_delivery(saved.id, "2026-08-19", now)
+    claim = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert claim is not None
     assert not storage.claim_delivery(saved.id, "2026-08-19", now)
-    storage.complete_delivery(saved.id, "2026-08-19", now)
+    assert storage.complete_delivery(claim, now)
     assert not storage.claim_delivery(saved.id, "2026-08-19", now + timedelta(hours=1))
     assert storage.delete_subscription(saved.id, "123")
     assert storage.list_subscriptions(target="123") == []
@@ -268,8 +275,189 @@ def test_stale_delivery_claim_can_be_retried(tmp_path) -> None:
     saved = storage.add_subscription(subscription())
     now = datetime(2026, 8, 20, tzinfo=UTC)
 
-    assert storage.claim_delivery(saved.id, "2026-08-19", now)
-    assert storage.claim_delivery(saved.id, "2026-08-19", now + timedelta(minutes=11))
+    first_claim = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert first_claim is not None
+    second_claim = storage.claim_delivery(
+        saved.id,
+        "2026-08-19",
+        now + timedelta(minutes=11),
+    )
+    assert second_claim is not None
+    assert second_claim.attempt_count == 2
+    assert second_claim.token != first_claim.token
+    assert not storage.complete_delivery(first_claim, now + timedelta(minutes=11))
+
+
+def test_initialization_recovers_legacy_in_progress_delivery(tmp_path) -> None:
+    database_path = tmp_path / "bot.sqlite3"
+    attempted_at = "2026-08-20T08:30:00+00:00"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(LEGACY_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO subscriptions (
+                channel, target, repository, digest_path, ref, token_env,
+                timezone, send_time, created_by, active
+            ) VALUES ('telegram', '123', 'owner/repo', 'docs/project-digest.md',
+                      'main', NULL, 'UTC', '09:00', 42, 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO deliveries (
+                subscription_id, digest_date, status, attempted_at
+            ) VALUES (1, '2026-08-19', 'sending', ?)
+            """,
+            (attempted_at,),
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    storage = Storage(database_path)
+    storage.initialize()
+
+    record = storage.get_delivery(1, "2026-08-19")
+    assert record is not None
+    assert record.status == "failed"
+    assert record.attempt_count == 1
+    assert record.next_attempt_at is None
+    assert record.failed_at == attempted_at
+    assert record.claim_token is None
+    assert "Ambiguous in-progress" in (record.error or "")
+
+
+def test_initialization_rejects_unknown_legacy_delivery_status(tmp_path) -> None:
+    database_path = tmp_path / "bot.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(LEGACY_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO subscriptions (
+                channel, target, repository, digest_path, ref, token_env,
+                timezone, send_time, created_by, active
+            ) VALUES ('telegram', '123', 'owner/repo', 'docs/project-digest.md',
+                      'main', NULL, 'UTC', '09:00', 42, 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO deliveries (
+                subscription_id, digest_date, status, attempted_at
+            ) VALUES (1, '2026-08-19', 'unknown', '2026-08-20T08:30:00+00:00')
+            """
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    with pytest.raises(SchemaMigrationError, match="invalid states"):
+        Storage(database_path).initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("SELECT status FROM deliveries").fetchone()[0] == (
+            "unknown"
+        )
+
+
+def test_failed_delivery_waits_for_backoff_and_becomes_terminal(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, tzinfo=UTC)
+    first_claim = storage.claim_delivery(saved.id, "2026-08-19", now, max_attempts=2)
+    assert first_claim is not None
+    retry_at = now + timedelta(minutes=1)
+
+    assert storage.fail_delivery(
+        first_claim,
+        now,
+        "temporary error",
+        next_attempt_at=retry_at,
+    )
+    assert storage.claim_delivery(
+        saved.id,
+        "2026-08-19",
+        retry_at - timedelta(seconds=1),
+        max_attempts=2,
+    ) is None
+    second_claim = storage.claim_delivery(
+        saved.id,
+        "2026-08-19",
+        retry_at,
+        max_attempts=2,
+    )
+    assert second_claim is not None
+    assert second_claim.attempt_count == 2
+    assert storage.fail_delivery(
+        second_claim,
+        retry_at,
+        "still failing",
+        next_attempt_at=None,
+    )
+
+    record = storage.get_delivery(saved.id, "2026-08-19")
+    assert record is not None
+    assert record.status == "failed"
+    assert record.attempt_count == 2
+    assert record.error == "still failing"
+    assert record.failed_at == retry_at.isoformat()
+    assert storage.claim_delivery(
+        saved.id,
+        "2026-08-19",
+        retry_at + timedelta(hours=1),
+        max_attempts=2,
+    ) is None
+
+
+def test_open_delivery_expires_after_delivery_window(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 13, 55, tzinfo=UTC)
+    window_end = datetime(2026, 8, 20, 14, 0, tzinfo=UTC)
+    claim = storage.claim_delivery(
+        saved.id,
+        "2026-08-19",
+        now,
+        window_end=window_end,
+    )
+    assert claim is not None
+    assert storage.fail_delivery(
+        claim,
+        now,
+        "temporary",
+        next_attempt_at=now + timedelta(minutes=1),
+    )
+
+    assert storage.expire_open_deliveries(window_end) == 1
+    record = storage.get_delivery(saved.id, "2026-08-19")
+    assert record is not None
+    assert record.status == "failed"
+    assert record.failed_at == window_end.isoformat()
+    assert record.next_attempt_at is None
+
+
+def test_sending_delivery_expires_after_window_and_lease(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 13, 55, tzinfo=UTC)
+    window_end = datetime(2026, 8, 20, 14, 0, tzinfo=UTC)
+    claim = storage.claim_delivery(
+        saved.id,
+        "2026-08-19",
+        now,
+        stale_after=timedelta(minutes=10),
+        window_end=window_end,
+    )
+    assert claim is not None
+
+    assert storage.expire_open_deliveries(window_end) == 0
+    assert storage.expire_open_deliveries(now + timedelta(minutes=10)) == 1
+    record = storage.get_delivery(saved.id, "2026-08-19")
+    assert record is not None
+    assert record.status == "failed"
 
 
 def test_updates_subscription_without_changing_ownership(tmp_path) -> None:

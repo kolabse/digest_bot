@@ -49,8 +49,69 @@ async def test_reads_raw_contents() -> None:
 async def test_private_repository_error_is_actionable() -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(404)))
     source = GitHubContentsSource(client)
-    with pytest.raises(GitHubSourceError, match="приватного"):
+    with pytest.raises(GitHubSourceError, match="приватного") as error:
         await source.read("owner/repo", "docs/project-digest.md", "main", None)
+    assert error.value.retryable is False
+    await client.aclose()
+
+
+async def test_server_error_is_retryable() -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+    source = GitHubContentsSource(client)
+
+    with pytest.raises(GitHubSourceError, match="HTTP 503") as error:
+        await source.read("owner/repo", "docs/project-digest.md", "main", None)
+
+    assert error.value.retryable is True
+    await client.aclose()
+
+
+async def test_github_rate_limit_is_retryable() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                403,
+                headers={"X-RateLimit-Remaining": "0", "Retry-After": "30"},
+            )
+        )
+    )
+    source = GitHubContentsSource(client)
+
+    with pytest.raises(GitHubSourceError, match="ограничил") as error:
+        await source.read("owner/repo", "docs/project-digest.md", "main", None)
+
+    assert error.value.retryable is True
+    assert error.value.retry_after_seconds == 30
+    await client.aclose()
+
+
+async def test_invalid_retry_after_is_ignored() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, headers={"Retry-After": "NaN"})
+        )
+    )
+    source = GitHubContentsSource(client)
+
+    with pytest.raises(GitHubSourceError) as error:
+        await source.read("owner/repo", "docs/project-digest.md", "main", None)
+
+    assert error.value.retryable is True
+    assert error.value.retry_after_seconds is None
+    await client.aclose()
+
+
+async def test_transport_error_is_retryable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = GitHubContentsSource(client)
+
+    with pytest.raises(GitHubSourceError, match="подключиться") as error:
+        await source.read("owner/repo", "docs/project-digest.md", "main", None)
+
+    assert error.value.retryable is True
     await client.aclose()
 
 
