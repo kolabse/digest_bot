@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 
 from digest_bot.errors import PermanentDeliveryError, RetryableDeliveryError
@@ -100,7 +101,8 @@ async def test_preview_works_during_quiet_window(tmp_path) -> None:
             created_by=42,
         )
     )
-    service = DeliveryService(storage, FakeSource(), {"telegram": FakeChannel()})
+    channel = FakeChannel()
+    service = DeliveryService(storage, FakeSource(), {"telegram": channel})
 
     message = await service.preview(
         saved.id,
@@ -252,7 +254,43 @@ async def test_permanent_failure_is_not_retried(tmp_path) -> None:
     assert record is not None
     assert record.status == "failed"
     assert record.attempt_count == 1
-    assert channel.attempts == 1
+    assert record.error == "PermanentDeliveryError"
+    assert channel.attempts == 2
+    assert len(channel.messages) == 1
+    assert "Рассылка #1 не доставлена" in channel.messages[0][1]
+    assert "bad target" not in channel.messages[0][1]
+
+
+async def test_permanent_notification_failure_is_not_retried_recursively(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(
+        Subscription(
+            id=None,
+            channel="telegram",
+            target="123",
+            repository="owner/repo",
+            digest_path="docs/project-digest.md",
+            ref="main",
+            token_env=None,
+            timezone="UTC",
+            send_time="08:00",
+            created_by=42,
+        )
+    )
+    channel = FailingChannel(
+        [PermanentDeliveryError("digest"), PermanentDeliveryError("alert")]
+    )
+    service = DeliveryService(storage, FakeSource(), {"telegram": channel})
+    now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
+
+    await service.dispatch_due(now)
+    await service.dispatch_due(now + timedelta(minutes=5))
+
+    assert saved.id is not None
+    assert storage.get_delivery(saved.id, "2026-08-19") is not None
+    assert channel.attempts == 2
+    assert channel.messages == []
 
 
 async def test_retryable_failure_stops_at_attempt_limit(tmp_path) -> None:
@@ -288,7 +326,155 @@ async def test_retryable_failure_stops_at_attempt_limit(tmp_path) -> None:
     assert record is not None
     assert record.status == "failed"
     assert record.attempt_count == 2
-    assert channel.attempts == 2
+    assert channel.attempts == 3
+    assert len(channel.messages) == 1
+    assert "исчерпаны повторные попытки" in channel.messages[0][1]
+
+
+async def test_failure_notification_retries_without_repeating_digest(tmp_path) -> None:
+    database_path = tmp_path / "bot.sqlite3"
+    storage = Storage(database_path)
+    storage.initialize()
+    saved = storage.add_subscription(
+        Subscription(
+            id=None,
+            channel="telegram",
+            target="123",
+            repository="owner/repo",
+            digest_path="docs/project-digest.md",
+            ref="main",
+            token_env=None,
+            timezone="UTC",
+            send_time="08:00",
+            created_by=42,
+        )
+    )
+    assert saved.id is not None
+    channel = FailingChannel(
+        [
+            PermanentDeliveryError("secret-token"),
+            RetryableDeliveryError("notification network"),
+        ]
+    )
+    policy = RetryPolicy(max_attempts=3, initial_delay_seconds=60, max_delay_seconds=60)
+    now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
+    service = DeliveryService(storage, FakeSource(), {"telegram": channel}, policy)
+
+    await service.dispatch_due(now)
+    restarted = DeliveryService(
+        Storage(database_path),
+        FakeSource(),
+        {"telegram": channel},
+        policy,
+    )
+    await restarted.dispatch_due(now + timedelta(seconds=59))
+    await restarted.dispatch_due(now + timedelta(minutes=1))
+
+    assert channel.attempts == 3
+    assert len(channel.messages) == 1
+    assert "Рассылка #1 не доставлена" in channel.messages[0][1]
+    assert "secret-token" not in channel.messages[0][1]
+
+
+async def test_stale_last_notification_attempt_is_logged(tmp_path, caplog) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(
+        Subscription(
+            id=None,
+            channel="telegram",
+            target="123",
+            repository="owner/repo",
+            digest_path="docs/project-digest.md",
+            ref="main",
+            token_env=None,
+            timezone="UTC",
+            send_time="08:00",
+            created_by=42,
+        )
+    )
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
+    delivery = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert delivery is not None
+    assert storage.fail_delivery(
+        delivery,
+        now,
+        "PermanentDeliveryError",
+        next_attempt_at=None,
+        reason="permanent_error",
+    )
+    assert storage.claim_failure_notification(
+        now,
+        max_attempts=1,
+        stale_after=timedelta(minutes=1),
+    ) is not None
+    service = DeliveryService(
+        storage,
+        FakeSource(),
+        {"telegram": FakeChannel()},
+        RetryPolicy(max_attempts=1, claim_lease_seconds=60),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await service.dispatch_due(now + timedelta(minutes=1))
+
+    assert "Failure notification abandoned after attempt limit" in caplog.text
+
+
+async def test_notification_backoff_uses_fresh_time_after_slow_failure(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(
+        Subscription(
+            id=None,
+            channel="telegram",
+            target="123",
+            repository="owner/repo",
+            digest_path="docs/project-digest.md",
+            ref="main",
+            token_env=None,
+            timezone="UTC",
+            send_time="08:00",
+            created_by=42,
+        )
+    )
+    assert saved.id is not None
+    start = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
+    failure_time = start + timedelta(minutes=2)
+    delivery = storage.claim_delivery(saved.id, "2026-08-19", start)
+    assert delivery is not None
+    assert storage.fail_delivery(
+        delivery,
+        start,
+        "PermanentDeliveryError",
+        next_attempt_at=None,
+        reason="permanent_error",
+    )
+    times = iter([start, failure_time])
+    policy = RetryPolicy(initial_delay_seconds=60, max_delay_seconds=60)
+    service = DeliveryService(
+        storage,
+        FakeSource(),
+        {"telegram": FailingChannel([RetryableDeliveryError("slow network")])},
+        policy,
+        clock=lambda: next(times),
+    )
+
+    await service._dispatch_failure_notifications(None)
+
+    assert storage.claim_failure_notification(
+        failure_time + timedelta(seconds=59),
+        max_attempts=policy.max_attempts,
+        stale_after=timedelta(seconds=policy.claim_lease_seconds),
+    ) is None
+    retry = storage.claim_failure_notification(
+        failure_time + timedelta(minutes=1),
+        max_attempts=policy.max_attempts,
+        stale_after=timedelta(seconds=policy.claim_lease_seconds),
+    )
+    assert retry is not None
+    assert retry.attempt_count == 2
 
 
 async def test_retry_does_not_cross_delivery_window(tmp_path) -> None:
@@ -353,7 +539,8 @@ async def test_scheduler_expires_retry_after_window_closes(tmp_path) -> None:
         "temporary",
         next_attempt_at=window_end - timedelta(seconds=30),
     )
-    service = DeliveryService(storage, FakeSource(), {"telegram": FakeChannel()})
+    channel = FakeChannel()
+    service = DeliveryService(storage, FakeSource(), {"telegram": channel})
 
     await service.dispatch_due(window_end)
 
@@ -361,6 +548,8 @@ async def test_scheduler_expires_retry_after_window_closes(tmp_path) -> None:
     assert record is not None
     assert record.status == "failed"
     assert record.failed_at == window_end.isoformat()
+    assert len(channel.messages) == 1
+    assert "завершилось окно доставки" in channel.messages[0][1]
 
 
 async def test_failure_backoff_uses_fresh_time_after_slow_operation(tmp_path) -> None:
@@ -383,7 +572,7 @@ async def test_failure_backoff_uses_fresh_time_after_slow_operation(tmp_path) ->
     assert saved.id is not None
     start = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
     failure_time = start + timedelta(minutes=2)
-    times = iter([start, start, failure_time])
+    times = iter([start, start, failure_time, failure_time])
     channel = FailingChannel([RetryableDeliveryError("temporary")])
     policy = RetryPolicy(initial_delay_seconds=60, max_delay_seconds=60)
     service = DeliveryService(

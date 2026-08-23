@@ -4,11 +4,17 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .migrations import migrate
-from .models import DeliveryClaim, DeliveryRecord, Subscription
+from .models import (
+    DeliveryClaim,
+    DeliveryRecord,
+    DeliveryStats,
+    FailureNotificationClaim,
+    Subscription,
+)
 
 
 class Storage:
@@ -191,6 +197,35 @@ class Storage:
             ).fetchone()
             return self._delivery_from_row(row) if row is not None else None
 
+    @staticmethod
+    def _enqueue_failure_notification(
+        connection: sqlite3.Connection,
+        subscription_id: int,
+        digest_date: str,
+        reason: str,
+        delivery_attempt_count: int,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO delivery_failure_notifications (
+                subscription_id, digest_date, channel, target, reason,
+                delivery_attempt_count, status, created_at
+            )
+            SELECT id, ?, channel, target, ?, ?, 'pending', ?
+            FROM subscriptions
+            WHERE id = ?
+            ON CONFLICT (subscription_id, digest_date) DO NOTHING
+            """,
+            (
+                digest_date,
+                reason,
+                delivery_attempt_count,
+                created_at,
+                subscription_id,
+            ),
+        )
+
     def claim_delivery(
         self,
         subscription_id: int,
@@ -228,7 +263,7 @@ class Storage:
             if cursor.rowcount > 0:
                 return DeliveryClaim(subscription_id, digest_date, 1, token)
 
-            connection.execute(
+            terminalized = connection.execute(
                 """
                 UPDATE deliveries SET
                     status = 'failed', failed_at = ?, next_attempt_at = NULL,
@@ -250,6 +285,22 @@ class Storage:
                     attempted_at,
                 ),
             )
+            if terminalized.rowcount > 0:
+                terminal_row = connection.execute(
+                    """
+                    SELECT attempt_count FROM deliveries
+                    WHERE subscription_id = ? AND digest_date = ?
+                    """,
+                    (subscription_id, digest_date),
+                ).fetchone()
+                self._enqueue_failure_notification(
+                    connection,
+                    subscription_id,
+                    digest_date,
+                    "attempts_exhausted",
+                    int(terminal_row["attempt_count"]),
+                    attempted_at,
+                )
             cursor = connection.execute(
                 """
                 UPDATE deliveries SET
@@ -315,6 +366,7 @@ class Storage:
         error: str,
         *,
         next_attempt_at: datetime | None,
+        reason: str = "delivery_failed",
     ) -> bool:
         status = "retrying" if next_attempt_at is not None else "failed"
         with self._connect() as connection:
@@ -336,10 +388,29 @@ class Storage:
                     claim.token,
                 ),
             )
-            return cursor.rowcount > 0
+            transitioned = cursor.rowcount > 0
+            if transitioned and next_attempt_at is None:
+                self._enqueue_failure_notification(
+                    connection,
+                    claim.subscription_id,
+                    claim.digest_date,
+                    reason,
+                    claim.attempt_count,
+                    now.isoformat(),
+                )
+            return transitioned
 
     def expire_open_deliveries(self, now: datetime) -> int:
         with self._connect() as connection:
+            candidates = connection.execute(
+                """
+                SELECT subscription_id, digest_date, attempt_count
+                FROM deliveries
+                WHERE (status = 'retrying' AND window_end_at <= ?)
+                   OR (status = 'sending' AND window_end_at <= ? AND lease_expires_at <= ?)
+                """,
+                (now.isoformat(), now.isoformat(), now.isoformat()),
+            ).fetchall()
             cursor = connection.execute(
                 """
                 UPDATE deliveries SET
@@ -355,5 +426,227 @@ class Storage:
                     now.isoformat(),
                     now.isoformat(),
                 ),
+            )
+            for row in candidates:
+                self._enqueue_failure_notification(
+                    connection,
+                    int(row["subscription_id"]),
+                    str(row["digest_date"]),
+                    "window_expired",
+                    int(row["attempt_count"]),
+                    now.isoformat(),
+                )
+            return cursor.rowcount
+
+    def delivery_stats(
+        self,
+        target: str,
+        subscription_id: int | None = None,
+    ) -> DeliveryStats | None:
+        with self._connect() as connection:
+            if subscription_id is not None:
+                exists = connection.execute(
+                    "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                    (subscription_id, target),
+                ).fetchone()
+                if exists is None:
+                    return None
+            params: list[object] = [target]
+            subscription_filter = ""
+            if subscription_id is not None:
+                subscription_filter = " AND d.subscription_id = ?"
+                params.append(subscription_id)
+            aggregate = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN d.status = 'sent' THEN 1 ELSE 0 END) AS sent,
+                    SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN d.status = 'retrying' THEN 1 ELSE 0 END) AS retrying,
+                    SUM(CASE WHEN d.status = 'sending' THEN 1 ELSE 0 END) AS sending,
+                    COALESCE(SUM(d.attempt_count), 0) AS attempts
+                FROM deliveries d
+                JOIN subscriptions s ON s.id = d.subscription_id
+                WHERE s.target = ?{subscription_filter}
+                """,
+                params,
+            ).fetchone()
+            latest_row = connection.execute(
+                f"""
+                SELECT d.* FROM deliveries d
+                JOIN subscriptions s ON s.id = d.subscription_id
+                WHERE s.target = ?{subscription_filter}
+                ORDER BY d.digest_date DESC, d.attempted_at DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            return DeliveryStats(
+                total=int(aggregate["total"]),
+                sent=int(aggregate["sent"] or 0),
+                failed=int(aggregate["failed"] or 0),
+                retrying=int(aggregate["retrying"] or 0),
+                sending=int(aggregate["sending"] or 0),
+                attempts=int(aggregate["attempts"]),
+                latest=self._delivery_from_row(latest_row) if latest_row is not None else None,
+            )
+
+    def claim_failure_notification(
+        self,
+        now: datetime,
+        *,
+        max_attempts: int,
+        stale_after: timedelta,
+    ) -> FailureNotificationClaim | None:
+        token = uuid.uuid4().hex
+        timestamp = now.isoformat()
+        lease_expires_at = (now + stale_after).isoformat()
+        with self._connect() as connection:
+            claimed = connection.execute(
+                """
+                UPDATE delivery_failure_notifications SET
+                    status = 'sending', attempt_count = attempt_count + 1,
+                    next_attempt_at = NULL, claim_token = ?, lease_expires_at = ?
+                WHERE (subscription_id, digest_date) = (
+                    SELECT subscription_id, digest_date
+                    FROM delivery_failure_notifications
+                    WHERE attempt_count < ? AND (
+                        status = 'pending'
+                        OR (status = 'retrying' AND next_attempt_at <= ?)
+                        OR (status = 'sending' AND lease_expires_at <= ?)
+                    )
+                    ORDER BY created_at, subscription_id, digest_date
+                    LIMIT 1
+                )
+                  AND attempt_count < ? AND (
+                    status = 'pending'
+                    OR (status = 'retrying' AND next_attempt_at <= ?)
+                    OR (status = 'sending' AND lease_expires_at <= ?)
+                  )
+                RETURNING *
+                """,
+                (
+                    token,
+                    lease_expires_at,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                ),
+            ).fetchone()
+            if claimed is None:
+                return None
+            return FailureNotificationClaim(
+                subscription_id=int(claimed["subscription_id"]),
+                digest_date=str(claimed["digest_date"]),
+                channel=str(claimed["channel"]),
+                target=str(claimed["target"]),
+                reason=str(claimed["reason"]),
+                delivery_attempt_count=int(claimed["delivery_attempt_count"]),
+                attempt_count=int(claimed["attempt_count"]),
+                token=token,
+            )
+
+    def abandon_exhausted_failure_notifications(
+        self,
+        now: datetime,
+        *,
+        max_attempts: int,
+    ) -> list[tuple[int, str, str]]:
+        timestamp = now.isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                UPDATE delivery_failure_notifications SET
+                    status = 'abandoned', next_attempt_at = NULL,
+                    claim_token = NULL, lease_expires_at = NULL,
+                    error = COALESCE(error, 'Notification attempt lease expired')
+                WHERE status IN ('retrying', 'sending') AND attempt_count >= ?
+                  AND ((status = 'retrying' AND next_attempt_at <= ?)
+                    OR (status = 'sending' AND lease_expires_at <= ?))
+                RETURNING subscription_id, digest_date, channel
+                """,
+                (max_attempts, timestamp, timestamp),
+            ).fetchall()
+            return [
+                (int(row["subscription_id"]), str(row["digest_date"]), str(row["channel"]))
+                for row in rows
+            ]
+
+    def complete_failure_notification(
+        self,
+        claim: FailureNotificationClaim,
+        now: datetime,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE delivery_failure_notifications SET
+                    status = 'sent', sent_at = ?, error = NULL,
+                    claim_token = NULL, lease_expires_at = NULL
+                WHERE subscription_id = ? AND digest_date = ?
+                  AND status = 'sending' AND claim_token = ?
+                """,
+                (now.isoformat(), claim.subscription_id, claim.digest_date, claim.token),
+            )
+            return cursor.rowcount > 0
+
+    def fail_failure_notification(
+        self,
+        claim: FailureNotificationClaim,
+        now: datetime,
+        error: str,
+        *,
+        next_attempt_at: datetime | None,
+    ) -> bool:
+        status = "retrying" if next_attempt_at is not None else "abandoned"
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE delivery_failure_notifications SET
+                    status = ?, next_attempt_at = ?, error = ?,
+                    claim_token = NULL, lease_expires_at = NULL
+                WHERE subscription_id = ? AND digest_date = ?
+                  AND status = 'sending' AND claim_token = ?
+                """,
+                (
+                    status,
+                    next_attempt_at.isoformat() if next_attempt_at is not None else None,
+                    error[:500],
+                    claim.subscription_id,
+                    claim.digest_date,
+                    claim.token,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def cleanup_deliveries(self, cutoff: datetime, *, batch_size: int) -> int:
+        if cutoff.tzinfo is None:
+            raise ValueError("cutoff must be timezone-aware")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        cutoff_value = cutoff.astimezone(UTC)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM deliveries
+                WHERE rowid IN (
+                    SELECT d.rowid
+                    FROM deliveries d
+                    LEFT JOIN delivery_failure_notifications n
+                      ON n.subscription_id = d.subscription_id
+                     AND n.digest_date = d.digest_date
+                    WHERE (
+                        (d.status = 'sent' AND d.sent_at < ?)
+                        OR (d.status = 'failed' AND d.failed_at < ?)
+                    )
+                      AND (n.status IS NULL OR n.status IN ('sent', 'abandoned'))
+                    ORDER BY COALESCE(d.sent_at, d.failed_at), d.rowid
+                    LIMIT ?
+                )
+                """,
+                (cutoff_value.isoformat(), cutoff_value.isoformat(), batch_size),
             )
             return cursor.rowcount

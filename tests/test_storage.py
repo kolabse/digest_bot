@@ -210,7 +210,260 @@ def test_initialization_creates_current_schema_and_is_idempotent(tmp_path) -> No
                 "SELECT name FROM sqlite_schema WHERE type = 'table'"
             )
         }
-        assert {"subscriptions", "deliveries"} <= tables
+        assert {
+            "subscriptions",
+            "deliveries",
+            "delivery_failure_notifications",
+        } <= tables
+
+
+def test_version_2_migration_preserves_deliveries_and_adds_empty_outbox(tmp_path) -> None:
+    database_path = tmp_path / "bot.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(migrations_module.SUBSCRIPTIONS_SCHEMA)
+        connection.execute(migrations_module.DELIVERIES_SCHEMA)
+        connection.execute(migrations_module.DELIVERIES_RETRY_INDEX)
+        connection.execute(
+            """
+            INSERT INTO subscriptions (
+                channel, target, repository, digest_path, ref, token_env,
+                timezone, send_time, created_by, active
+            ) VALUES ('telegram', '123', 'owner/repo', 'docs/project-digest.md',
+                      'main', NULL, 'UTC', '09:00', 42, 1)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO deliveries (
+                subscription_id, digest_date, status, attempted_at, sent_at,
+                error, attempt_count, next_attempt_at, failed_at, claim_token,
+                window_end_at, lease_expires_at
+            ) VALUES (1, '2026-08-19', 'sent', '2026-08-20T09:00:00+00:00',
+                      '2026-08-20T09:00:01+00:00', NULL, 1, NULL, NULL, NULL,
+                      '2026-08-20T14:00:00+00:00', NULL)
+            """
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+    storage = Storage(database_path)
+    storage.initialize()
+
+    record = storage.get_delivery(1, "2026-08-19")
+    assert record is not None
+    assert record.status == "sent"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM delivery_failure_notifications"
+        ).fetchone()[0] == 0
+
+
+def test_delivery_stats_are_scoped_and_include_latest_record(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    first = storage.add_subscription(subscription())
+    second = storage.add_subscription(replace(subscription(), target="999"))
+    assert first.id is not None
+    assert second.id is not None
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    first_claim = storage.claim_delivery(first.id, "2026-08-19", now)
+    second_claim = storage.claim_delivery(second.id, "2026-08-19", now)
+    assert first_claim is not None
+    assert second_claim is not None
+    assert storage.complete_delivery(first_claim, now)
+    assert storage.fail_delivery(
+        second_claim,
+        now,
+        "PermanentDeliveryError",
+        next_attempt_at=None,
+        reason="permanent_error",
+    )
+
+    stats = storage.delivery_stats("123", first.id)
+
+    assert stats is not None
+    assert (stats.total, stats.sent, stats.failed, stats.attempts) == (1, 1, 0, 1)
+    assert stats.latest is not None
+    assert stats.latest.digest_date == "2026-08-19"
+    assert storage.delivery_stats("123", second.id) is None
+
+
+def test_failure_notification_is_durable_and_cleanup_waits_for_it(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    claim = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert claim is not None
+    assert storage.fail_delivery(
+        claim,
+        now,
+        "PermanentDeliveryError: secret-value",
+        next_attempt_at=None,
+        reason="permanent_error",
+    )
+
+    notification = storage.claim_failure_notification(
+        now,
+        max_attempts=3,
+        stale_after=timedelta(minutes=10),
+    )
+    assert notification is not None
+    assert notification.reason == "permanent_error"
+    assert notification.target == "123"
+    assert storage.cleanup_deliveries(now + timedelta(days=1), batch_size=10) == 0
+    assert storage.complete_failure_notification(notification, now)
+    assert storage.cleanup_deliveries(now + timedelta(days=1), batch_size=10) == 1
+    assert storage.get_delivery(saved.id, "2026-08-19") is None
+
+
+def test_failure_notification_retry_survives_restart(tmp_path) -> None:
+    database_path = tmp_path / "bot.sqlite3"
+    storage = Storage(database_path)
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    delivery = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert delivery is not None
+    assert storage.fail_delivery(
+        delivery,
+        now,
+        "RetryableDeliveryError",
+        next_attempt_at=None,
+        reason="attempts_exhausted",
+    )
+    first = storage.claim_failure_notification(
+        now,
+        max_attempts=3,
+        stale_after=timedelta(minutes=10),
+    )
+    assert first is not None
+    retry_at = now + timedelta(minutes=1)
+    assert storage.fail_failure_notification(
+        first,
+        now,
+        "NetworkError",
+        next_attempt_at=retry_at,
+    )
+
+    restarted = Storage(database_path)
+    restarted.initialize()
+    assert restarted.claim_failure_notification(
+        retry_at - timedelta(seconds=1),
+        max_attempts=3,
+        stale_after=timedelta(minutes=10),
+    ) is None
+    second = restarted.claim_failure_notification(
+        retry_at,
+        max_attempts=3,
+        stale_after=timedelta(minutes=10),
+    )
+    assert second is not None
+    assert second.attempt_count == 2
+
+
+def test_failure_notification_stale_claim_is_token_fenced(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    delivery = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert delivery is not None
+    assert storage.fail_delivery(
+        delivery,
+        now,
+        "PermanentDeliveryError",
+        next_attempt_at=None,
+        reason="permanent_error",
+    )
+    first = storage.claim_failure_notification(
+        now,
+        max_attempts=3,
+        stale_after=timedelta(minutes=1),
+    )
+    assert first is not None
+    second = storage.claim_failure_notification(
+        now + timedelta(minutes=1),
+        max_attempts=3,
+        stale_after=timedelta(minutes=1),
+    )
+    assert second is not None
+    assert second.attempt_count == 2
+    assert not storage.complete_failure_notification(first, now + timedelta(minutes=1))
+    assert storage.complete_failure_notification(second, now + timedelta(minutes=1))
+
+
+def test_exhausted_stale_notification_is_reported_as_abandoned(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    delivery = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert delivery is not None
+    assert storage.fail_delivery(
+        delivery,
+        now,
+        "PermanentDeliveryError",
+        next_attempt_at=None,
+        reason="permanent_error",
+    )
+    notification = storage.claim_failure_notification(
+        now,
+        max_attempts=1,
+        stale_after=timedelta(minutes=1),
+    )
+    assert notification is not None
+
+    abandoned = storage.abandon_exhausted_failure_notifications(
+        now + timedelta(minutes=1),
+        max_attempts=1,
+    )
+
+    assert abandoned == [(saved.id, "2026-08-19", "telegram")]
+    assert storage.claim_failure_notification(
+        now + timedelta(minutes=1),
+        max_attempts=1,
+        stale_after=timedelta(minutes=1),
+    ) is None
+    assert not storage.complete_failure_notification(
+        notification,
+        now + timedelta(minutes=1),
+    )
+
+
+def test_cleanup_keeps_open_recent_and_cutoff_boundary_deliveries(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    cutoff = datetime(2026, 8, 20, 9, tzinfo=UTC)
+
+    old = storage.claim_delivery(saved.id, "2026-08-16", cutoff - timedelta(days=2))
+    boundary = storage.claim_delivery(saved.id, "2026-08-17", cutoff)
+    recent = storage.claim_delivery(saved.id, "2026-08-18", cutoff + timedelta(seconds=1))
+    open_claim = storage.claim_delivery(
+        saved.id,
+        "2026-08-19",
+        cutoff - timedelta(days=3),
+        window_end=cutoff + timedelta(days=1),
+    )
+    assert old is not None
+    assert boundary is not None
+    assert recent is not None
+    assert open_claim is not None
+    assert storage.complete_delivery(old, cutoff - timedelta(days=2))
+    assert storage.complete_delivery(boundary, cutoff)
+    assert storage.complete_delivery(recent, cutoff + timedelta(seconds=1))
+
+    assert storage.cleanup_deliveries(cutoff, batch_size=10) == 1
+    assert storage.get_delivery(saved.id, "2026-08-16") is None
+    assert storage.get_delivery(saved.id, "2026-08-17") is not None
+    assert storage.get_delivery(saved.id, "2026-08-18") is not None
+    assert storage.get_delivery(saved.id, "2026-08-19") is not None
 
 
 def test_initialization_rejects_newer_schema_version(tmp_path) -> None:
