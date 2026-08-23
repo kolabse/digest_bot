@@ -85,3 +85,30 @@ async def test_preview_works_during_quiet_window(tmp_path) -> None:
     assert "19.08.2026" in message
     assert "вчера" in message.lower()
     assert "Дайджест доставлен" in message
+
+
+async def test_paused_subscription_is_not_dispatched(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(
+        Subscription(
+            id=None,
+            channel="telegram",
+            target="123",
+            repository="owner/repo",
+            digest_path="docs/project-digest.md",
+            ref="main",
+            token_env=None,
+            timezone="UTC",
+            send_time="08:00",
+            created_by=42,
+        )
+    )
+    assert saved.id is not None
+    storage.set_subscription_active(saved.id, saved.target, False)
+    channel = FakeChannel()
+    service = DeliveryService(storage, FakeSource(), {"telegram": channel})
+
+    await service.dispatch_due(datetime(2026, 8, 20, 8, 30, tzinfo=UTC))
+
+    assert channel.messages == []

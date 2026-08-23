@@ -134,6 +134,26 @@ class Storage:
             ).fetchone()
             return self._from_row(row)
 
+    def set_subscription_active(
+        self,
+        subscription_id: int,
+        target: str,
+        active: bool,
+    ) -> Subscription | None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE subscriptions SET active = ?
+                WHERE id = ? AND target = ?
+                """,
+                (int(active), subscription_id, target),
+            )
+            row = connection.execute(
+                "SELECT * FROM subscriptions WHERE id = ? AND target = ?",
+                (subscription_id, target),
+            ).fetchone()
+            return self._from_row(row) if row is not None else None
+
     def delete_subscription(self, subscription_id: int, target: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
