@@ -97,6 +97,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/setup — добавить рассылку\n"
         "/edit ID — изменить рассылку\n"
         "/list — показать рассылки текущего чата\n"
+        "/pause ID — приостановить рассылку\n"
+        "/resume ID — возобновить рассылку\n"
         "/preview ID — показать сообщение за подходящую дату\n"
         "/delete ID — удалить рассылку\n"
         "/cancel — отменить текущую настройку\n\n"
@@ -360,11 +362,45 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("В этом чате пока нет рассылок.")
         return
     lines = [
-        f"#{item.id} · {item.repository}/{item.digest_path} · "
+        f"#{item.id} · {'активна' if item.active else 'приостановлена'} · "
+        f"{item.repository}/{item.digest_path} · "
         f"{item.send_time} {item.timezone} · {item.channel}"
         for item in items
     ]
     await update.effective_message.reply_text("Рассылки:\n" + "\n".join(lines))
+
+
+async def _set_subscription_active(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    active: bool,
+) -> None:
+    if not await _authorized(update, context):
+        return
+    command = "resume" if active else "pause"
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text(f"Использование: /{command} ID")
+        return
+    subscription_id = int(context.args[0])
+    subscription = _storage(context).set_subscription_active(
+        subscription_id,
+        str(update.effective_chat.id),
+        active,
+    )
+    if subscription is None:
+        await update.effective_message.reply_text("Рассылка не найдена.")
+        return
+    action = "возобновлена" if active else "приостановлена"
+    await update.effective_message.reply_text(f"Рассылка #{subscription_id} {action}.")
+
+
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_subscription_active(update, context, active=False)
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_subscription_active(update, context, active=True)
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -426,6 +462,8 @@ def build_application(settings: Settings) -> Application:
                 BotCommand("setup", "добавить рассылку"),
                 BotCommand("edit", "изменить рассылку"),
                 BotCommand("list", "показать рассылки"),
+                BotCommand("pause", "приостановить рассылку"),
+                BotCommand("resume", "возобновить рассылку"),
                 BotCommand("preview", "проверить сообщение"),
                 BotCommand("delete", "удалить рассылку"),
                 BotCommand("help", "помощь"),
@@ -476,6 +514,8 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("list", list_command))
+    application.add_handler(CommandHandler("pause", pause_command))
+    application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("preview", preview_command))
     application.add_error_handler(error_handler)

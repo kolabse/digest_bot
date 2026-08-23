@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -329,3 +330,22 @@ def test_subscription_lookup_and_update_are_scoped_to_target(tmp_path) -> None:
     )
     assert storage.update_subscription(foreign) is None
     assert storage.get_subscription(saved.id, saved.target) == saved
+
+
+def test_subscription_active_state_is_scoped_idempotent_and_persistent(tmp_path) -> None:
+    database_path = tmp_path / "bot.sqlite3"
+    storage = Storage(database_path)
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+
+    paused = storage.set_subscription_active(saved.id, saved.target, False)
+    assert paused == replace(saved, active=False)
+    assert storage.set_subscription_active(saved.id, saved.target, False) == paused
+    assert storage.set_subscription_active(saved.id, "another-chat", True) is None
+    assert storage.set_subscription_active(999, saved.target, True) is None
+
+    restarted_storage = Storage(database_path)
+    restarted_storage.initialize()
+    assert restarted_storage.get_subscription(saved.id, saved.target) == paused
+    assert restarted_storage.set_subscription_active(saved.id, saved.target, True) == saved
