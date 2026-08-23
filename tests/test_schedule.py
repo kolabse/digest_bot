@@ -41,6 +41,7 @@ def test_due_delivery_catches_up_inside_same_window() -> None:
     due = due_delivery("UTC", "08:00", now)
     assert due is not None
     assert due.digest_date.isoformat() == "2026-08-19"
+    assert due.window_end == datetime(2026, 8, 20, 14, 0, tzinfo=UTC)
 
 
 def test_due_delivery_does_not_cross_quiet_window() -> None:
@@ -54,6 +55,7 @@ def test_timezone_controls_window_and_date() -> None:
     due = due_delivery("Asia/Yekaterinburg", "00:15", now)
     assert due is not None
     assert due.digest_date.isoformat() == "2026-08-20"
+    assert due.window_end.isoformat() == "2026-08-21T14:00:00+05:00"
 
 
 def test_preview_date_comes_from_configured_send_window() -> None:

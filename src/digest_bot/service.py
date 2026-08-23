@@ -1,15 +1,45 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+import math
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from .channels.base import DeliveryChannel
 from .digest import extract_digest, render_message
+from .errors import DeliveryOperationError
 from .github import RepositoryContentsSource
 from .schedule import digest_date_for_send_time, due_delivery
 from .storage import Storage
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    max_attempts: int = 5
+    initial_delay_seconds: int = 60
+    max_delay_seconds: int = 3600
+    claim_lease_seconds: int = 3600
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if self.initial_delay_seconds < 1:
+            raise ValueError("initial_delay_seconds must be at least 1")
+        if self.max_delay_seconds < self.initial_delay_seconds:
+            raise ValueError("max_delay_seconds must not be less than initial_delay_seconds")
+        if self.claim_lease_seconds < 60:
+            raise ValueError("claim_lease_seconds must be at least 60")
+
+    def delay_seconds(self, attempt_count: int) -> float:
+        return float(
+            min(
+                self.initial_delay_seconds * (2 ** max(attempt_count - 1, 0)),
+                self.max_delay_seconds,
+            )
+        )
 
 
 class DeliveryService:
@@ -18,21 +48,39 @@ class DeliveryService:
         storage: Storage,
         source: RepositoryContentsSource,
         channels: dict[str, DeliveryChannel],
+        retry_policy: RetryPolicy | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._storage = storage
         self._source = source
         self._channels = channels
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def dispatch_due(self, now: datetime | None = None) -> None:
-        current = now or datetime.now(UTC)
+        def current_time() -> datetime:
+            return now if now is not None else self._clock()
+
+        expired = self._storage.expire_open_deliveries(current_time())
+        if expired:
+            LOGGER.error("Expired open deliveries after window close: count=%s", expired)
         for subscription in self._storage.list_subscriptions():
             if not subscription.active or subscription.id is None:
                 continue
-            due = due_delivery(subscription.timezone, subscription.send_time, current)
+            claim_time = current_time()
+            due = due_delivery(subscription.timezone, subscription.send_time, claim_time)
             if due is None:
                 continue
             digest_date = due.digest_date.isoformat()
-            if not self._storage.claim_delivery(subscription.id, digest_date, current):
+            claim = self._storage.claim_delivery(
+                subscription.id,
+                digest_date,
+                claim_time,
+                max_attempts=self._retry_policy.max_attempts,
+                stale_after=timedelta(seconds=self._retry_policy.claim_lease_seconds),
+                window_end=due.window_end.astimezone(UTC),
+            )
+            if claim is None:
                 continue
             try:
                 markdown = await self._source.read(
@@ -48,16 +96,80 @@ class DeliveryService:
                 )
                 channel = self._channels[subscription.channel]
                 await channel.send(subscription.target, message)
-                self._storage.complete_delivery(subscription.id, digest_date, datetime.now(UTC))
+            except Exception as exc:
+                operation_error = exc if isinstance(exc, DeliveryOperationError) else None
+                retryable = operation_error.retryable if operation_error else False
+                retry_after = (
+                    operation_error.retry_after_seconds if operation_error else None
+                )
+                failure_time = current_time()
+                delay = self._retry_policy.delay_seconds(claim.attempt_count)
+                if retry_after is not None and math.isfinite(retry_after) and retry_after > 0:
+                    delay = max(delay, retry_after)
+                window_end = due.window_end.astimezone(UTC)
+                remaining_seconds = max((window_end - failure_time).total_seconds(), 0)
+                delay = min(delay, remaining_seconds)
+                next_attempt_at = failure_time + timedelta(seconds=delay)
+                exhausted = claim.attempt_count >= self._retry_policy.max_attempts
+                if not retryable or exhausted or next_attempt_at >= window_end:
+                    next_attempt_at = None
+                error = f"{type(exc).__name__}: {exc}"
+                transitioned = self._storage.fail_delivery(
+                    claim,
+                    failure_time,
+                    error,
+                    next_attempt_at=next_attempt_at,
+                )
+                if not transitioned:
+                    LOGGER.warning(
+                        "Ignored failure from stale delivery claim: "
+                        "subscription_id=%s digest_date=%s attempt=%s",
+                        subscription.id,
+                        digest_date,
+                        claim.attempt_count,
+                    )
+                elif next_attempt_at is not None:
+                    LOGGER.warning(
+                        "Delivery retry scheduled: subscription_id=%s digest_date=%s "
+                        "channel=%s attempt=%s/%s next_attempt_at=%s error_type=%s",
+                        subscription.id,
+                        digest_date,
+                        subscription.channel,
+                        claim.attempt_count,
+                        self._retry_policy.max_attempts,
+                        next_attempt_at.isoformat(),
+                        type(exc).__name__,
+                    )
+                else:
+                    LOGGER.exception(
+                        "Delivery failed permanently: subscription_id=%s digest_date=%s "
+                        "channel=%s attempt=%s/%s retryable=%s",
+                        subscription.id,
+                        digest_date,
+                        subscription.channel,
+                        claim.attempt_count,
+                        self._retry_policy.max_attempts,
+                        retryable,
+                    )
+                continue
+
+            completed = self._storage.complete_delivery(claim, current_time())
+            if completed:
                 LOGGER.info(
-                    "Sent digest %s for subscription %s via %s",
+                    "Sent digest: digest_date=%s subscription_id=%s channel=%s attempt=%s",
                     digest_date,
                     subscription.id,
                     subscription.channel,
+                    claim.attempt_count,
                 )
-            except Exception as exc:
-                self._storage.release_delivery(subscription.id, digest_date, str(exc))
-                LOGGER.exception("Delivery failed for subscription %s", subscription.id)
+            else:
+                LOGGER.warning(
+                    "Delivery completed after claim was lost: subscription_id=%s "
+                    "digest_date=%s attempt=%s",
+                    subscription.id,
+                    digest_date,
+                    claim.attempt_count,
+                )
 
     async def preview(self, subscription_id: int, target: str, now: datetime | None = None) -> str:
         subscriptions = {
