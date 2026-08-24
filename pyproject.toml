@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "project-digest-bot"
 version = "0.2.0"
-description = "Scheduled delivery of project digests from GitHub to Telegram"
+description = "Scheduled delivery of project digests from Git repositories to Telegram and email"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }

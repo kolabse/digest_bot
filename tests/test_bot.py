@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from telegram.ext import ConversationHandler
 
+import digest_bot.bot as bot_module
 from digest_bot.bot import (
     CONFIRM,
     KEEP_VALUE,
@@ -44,7 +45,7 @@ from digest_bot.bot import (
     timezone_step,
     token_env_step,
 )
-from digest_bot.config import Settings
+from digest_bot.config import Settings, SmtpSettings
 from digest_bot.models import Subscription
 from digest_bot.storage import Storage
 
@@ -408,7 +409,7 @@ async def test_setup_and_texts_dialogs_cannot_overlap(tmp_path) -> None:
     assert await cancel(update, context) == ConversationHandler.END
     assert await texts_start(update, context) == TEXT_MENU
     assert await setup_start(update, context) == TEXT_MENU
-    assert "Сначала завершите настройку текстов" in update.effective_message.replies[-1][0]
+    assert "Сначала завершите текущую настройку" in update.effective_message.replies[-1][0]
     assert await cancel(update, context) == ConversationHandler.END
     assert "workflow" not in context.chat_data
     assert "texts" not in context.chat_data
@@ -605,10 +606,102 @@ async def test_pause_requires_configured_admin_access(tmp_path) -> None:
 
     await pause_command(update, make_context(storage, str(saved.id)))
 
-    assert update.effective_message.replies[-1][0] == (
-        "У вас нет доступа к настройке этого бота."
-    )
+    assert update.effective_message.replies[-1][0] == ("У вас нет доступа к настройке этого бота.")
     assert storage.get_subscription(saved.id, saved.target).active is True
+
+
+async def test_email_group_dialog_creates_named_recipient_group(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    update = make_update()
+    context = make_context(storage)
+
+    assert await bot_module.emailgroup_add_start(update, context) == bot_module.GROUP_NAME
+    update.effective_message.text = "Команда проекта"
+    assert await bot_module.group_name_step(update, context) == bot_module.GROUP_RECIPIENTS
+    update.effective_message.text = "first@example.com, second@example.com"
+    assert await bot_module.group_recipients_step(update, context) == bot_module.GROUP_CONFIRM
+    update.effective_message.text = "Да"
+    assert await bot_module.group_confirm_step(update, context) == ConversationHandler.END
+
+    groups = storage.list_email_recipient_groups("123")
+    assert len(groups) == 1
+    assert groups[0].name == "Команда проекта"
+    assert groups[0].recipients == ("first@example.com", "second@example.com")
+
+
+async def test_email_setup_selects_chat_scoped_recipient_group(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    group = storage.add_email_recipient_group("123", 42, "Команда", ["team@example.com"])
+    update = make_update()
+    context = make_context(storage)
+    context.application.bot_data["settings"] = replace(
+        context.application.bot_data["settings"],
+        smtp=SmtpSettings(
+            host="smtp.example.com",
+            port=587,
+            sender="digest@example.com",
+            security="starttls",
+            username=None,
+            password=None,
+            timeout_seconds=30,
+        ),
+    )
+
+    assert await setup_start(update, context) == 0
+    update.effective_message.text = "Email"
+    assert await channel_step(update, context) == bot_module.EMAIL_GROUP_SELECT
+    update.effective_message.text = str(group.id)
+    assert await bot_module.email_group_select_step(update, context) == REPOSITORY
+    update.effective_message.text = "owner/repo"
+    assert await repository_step(update, context) == PATH
+    update.effective_message.text = "docs/project-digest.md"
+    assert await path_step(update, context) == REF
+    update.effective_message.text = "main"
+    assert await ref_step(update, context) == TOKEN_ENV
+    update.effective_message.text = "Публичный репозиторий"
+    assert await token_env_step(update, context) == TIMEZONE
+    update.effective_message.text = "UTC"
+    assert await timezone_step(update, context) == SEND_TIME
+    update.effective_message.text = "09:00"
+    assert await send_time_step(update, context) == CONFIRM
+    update.effective_message.text = "Да"
+    assert await confirm_step(update, context) == ConversationHandler.END
+
+    saved = storage.list_subscriptions(target="123")
+    assert len(saved) == 1
+    assert saved[0].channel == "email"
+    assert saved[0].target == storage.email_group_target(group.id)
+    assert saved[0].control_target == "123"
+
+
+async def test_email_group_dialog_edits_and_deletes_group(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    group = storage.add_email_recipient_group("123", 42, "Команда", ["old@example.com"])
+    update = make_update()
+    context = make_context(storage, str(group.id))
+
+    assert await bot_module.emailgroup_edit_start(update, context) == bot_module.GROUP_NAME
+    update.effective_message.text = KEEP_VALUE
+    assert await bot_module.group_name_step(update, context) == bot_module.GROUP_RECIPIENTS
+    update.effective_message.text = "new@example.com"
+    assert await bot_module.group_recipients_step(update, context) == bot_module.GROUP_CONFIRM
+    update.effective_message.text = "Да"
+    assert await bot_module.group_confirm_step(update, context) == ConversationHandler.END
+    updated = storage.get_email_recipient_group(group.id, "123")
+    assert updated is not None
+    assert updated.name == "Команда"
+    assert updated.recipients == ("new@example.com",)
+
+    context = make_context(storage, str(group.id))
+    assert (
+        await bot_module.emailgroup_delete_start(update, context) == bot_module.GROUP_DELETE_CONFIRM
+    )
+    update.effective_message.text = "Да"
+    assert await bot_module.group_delete_confirm_step(update, context) == ConversationHandler.END
+    assert storage.get_email_recipient_group(group.id, "123") is None
 
 
 async def test_pause_requires_group_admin_access(tmp_path) -> None:

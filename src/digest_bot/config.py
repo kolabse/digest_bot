@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 from dataclasses import dataclass
+from email.errors import HeaderParseError
+from email.headerregistry import Address
 from pathlib import Path
 
 
 class ConfigurationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class SmtpSettings:
+    host: str
+    port: int
+    sender: str
+    security: str
+    username: str | None
+    password: str | None
+    timeout_seconds: int
 
 
 def _parse_ids(raw: str) -> frozenset[int]:
@@ -49,6 +64,7 @@ class Settings:
     delivery_claim_lease_seconds: int = 3600
     delivery_history_retention_days: int = 90
     delivery_cleanup_batch_size: int = 500
+    smtp: SmtpSettings | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -67,6 +83,7 @@ class Settings:
                 "DELIVERY_RETRY_MAX_SECONDS must be greater than or equal to "
                 "DELIVERY_RETRY_INITIAL_SECONDS"
             )
+        smtp = _smtp_settings_from_env()
         return cls(
             telegram_bot_token=token,
             telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL", "").strip() or None,
@@ -81,4 +98,69 @@ class Settings:
             delivery_claim_lease_seconds=claim_lease,
             delivery_history_retention_days=retention_days,
             delivery_cleanup_batch_size=cleanup_batch_size,
+            smtp=smtp,
         )
+
+
+def _smtp_settings_from_env() -> SmtpSettings | None:
+    names = (
+        "SMTP_HOST",
+        "SMTP_FROM",
+        "SMTP_PORT",
+        "SMTP_SECURITY",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+        "SMTP_TIMEOUT_SECONDS",
+    )
+    values = {name: os.getenv(name, "").strip() for name in names}
+    host = values["SMTP_HOST"]
+    if not host:
+        if any(values[name] for name in names if name != "SMTP_HOST"):
+            raise ConfigurationError("SMTP_HOST is required when SMTP is configured")
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        labels = host.split(".")
+        hostname_label = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+        if (
+            len(host) > 253
+            or not labels
+            or any(not hostname_label.fullmatch(label) for label in labels)
+        ):
+            raise ConfigurationError("SMTP_HOST must be a valid hostname or IP address") from None
+    sender = values["SMTP_FROM"]
+    if not sender:
+        raise ConfigurationError("SMTP_FROM is required when SMTP is configured")
+    try:
+        address = Address(addr_spec=sender)
+    except (HeaderParseError, ValueError) as exc:
+        raise ConfigurationError("SMTP_FROM must be a valid email address") from exc
+    security = values["SMTP_SECURITY"].casefold() or "starttls"
+    if security not in {"starttls", "ssl"}:
+        raise ConfigurationError("SMTP_SECURITY must be starttls or ssl")
+    default_port = 465 if security == "ssl" else 587
+    raw_port = values["SMTP_PORT"] or str(default_port)
+    raw_timeout = values["SMTP_TIMEOUT_SECONDS"] or "30"
+    try:
+        port = int(raw_port)
+        timeout = int(raw_timeout)
+    except ValueError as exc:
+        raise ConfigurationError("SMTP_PORT and SMTP_TIMEOUT_SECONDS must be integers") from exc
+    if not 1 <= port <= 65535:
+        raise ConfigurationError("SMTP_PORT must be between 1 and 65535")
+    if timeout < 1:
+        raise ConfigurationError("SMTP_TIMEOUT_SECONDS must be at least 1")
+    username = values["SMTP_USERNAME"] or None
+    password = values["SMTP_PASSWORD"] or None
+    if (username is None) != (password is None):
+        raise ConfigurationError("SMTP_USERNAME and SMTP_PASSWORD must be set together")
+    return SmtpSettings(
+        host=host,
+        port=port,
+        sender=address.addr_spec,
+        security=security,
+        username=username,
+        password=password,
+        timeout_seconds=timeout,
+    )

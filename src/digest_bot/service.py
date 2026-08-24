@@ -131,16 +131,12 @@ class DeliveryService:
                 failure_time = current_time()
                 scan_time = failure_time
                 delay = self._retry_policy.delay_seconds(claim.attempt_count)
-                retry_after = (
-                    operation_error.retry_after_seconds if operation_error else None
-                )
+                retry_after = operation_error.retry_after_seconds if operation_error else None
                 if retry_after is not None and math.isfinite(retry_after) and retry_after > 0:
                     delay = max(delay, retry_after)
                 exhausted = claim.attempt_count >= self._retry_policy.max_attempts
                 next_attempt_at = (
-                    failure_time + timedelta(seconds=delay)
-                    if retryable and not exhausted
-                    else None
+                    failure_time + timedelta(seconds=delay) if retryable and not exhausted else None
                 )
                 transitioned = self._storage.fail_failure_notification(
                     claim,
@@ -206,9 +202,7 @@ class DeliveryService:
                     subscription.token_env,
                 )
                 document = extract_digest(markdown, due.digest_date)
-                custom_variants = tuple(
-                    self._storage.list_message_variants(subscription.id) or ()
-                )
+                custom_variants = tuple(self._storage.list_message_variants(subscription.id) or ())
                 message = render_message(
                     document,
                     digest_is_today=due.digest_date == due.local_now.date(),
@@ -216,13 +210,15 @@ class DeliveryService:
                     custom_variants=custom_variants,
                 )
                 channel = self._channels[subscription.channel]
-                await channel.send(subscription.target, message)
+                await channel.send(
+                    subscription.target,
+                    message,
+                    delivery_key=f"{subscription.id}:{digest_date}",
+                )
             except Exception as exc:
                 operation_error = exc if isinstance(exc, DeliveryOperationError) else None
                 retryable = operation_error.retryable if operation_error else False
-                retry_after = (
-                    operation_error.retry_after_seconds if operation_error else None
-                )
+                retry_after = operation_error.retry_after_seconds if operation_error else None
                 failure_time = current_time()
                 maintenance_time = failure_time
                 delay = self._retry_policy.delay_seconds(claim.attempt_count)
@@ -311,9 +307,7 @@ class DeliveryService:
             LOGGER.info("Cleaned terminal delivery history: count=%s", deleted)
 
     async def preview(self, subscription_id: int, target: str, now: datetime | None = None) -> str:
-        subscriptions = {
-            item.id: item for item in self._storage.list_subscriptions(target=target)
-        }
+        subscriptions = {item.id: item for item in self._storage.list_subscriptions(target=target)}
         subscription = subscriptions.get(subscription_id)
         if subscription is None:
             raise LookupError("Рассылка не найдена в этом чате.")
@@ -332,7 +326,5 @@ class DeliveryService:
             extract_digest(markdown, digest_date),
             digest_is_today=digest_date == local.date(),
             selection_key=f"{subscription.id}:{digest_date.isoformat()}",
-            custom_variants=tuple(
-                self._storage.list_message_variants(subscription.id or 0) or ()
-            ),
+            custom_variants=tuple(self._storage.list_message_variants(subscription.id or 0) or ()),
         )

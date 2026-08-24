@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import time
 from typing import Any
 
@@ -16,6 +17,7 @@ from telegram.ext import (
     filters,
 )
 
+from .channels.email import EmailChannel
 from .channels.telegram import TelegramChannel
 from .config import Settings
 from .github import RepositoryContentsSource, normalize_digest_path, normalize_repository
@@ -26,9 +28,14 @@ from .storage import StaleMessageVariantsError, Storage
 
 LOGGER = logging.getLogger(__name__)
 CHANNEL, REPOSITORY, PATH, REF, TOKEN_ENV, TIMEZONE, SEND_TIME, CONFIRM = range(8)
-TEXT_MENU, TEXT_ACTION, TEXT_TODAY, TEXT_YESTERDAY, TEXT_WEIGHT, TEXT_DELETE = range(
-    8, 14
-)
+TEXT_MENU, TEXT_ACTION, TEXT_TODAY, TEXT_YESTERDAY, TEXT_WEIGHT, TEXT_DELETE = range(8, 14)
+(
+    EMAIL_GROUP_SELECT,
+    GROUP_NAME,
+    GROUP_RECIPIENTS,
+    GROUP_CONFIRM,
+    GROUP_DELETE_CONFIRM,
+) = range(14, 19)
 TOKEN_ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 KEEP_VALUE = "Оставить без изменений"
 WORKFLOW_LEASE_SECONDS = 30 * 60
@@ -76,7 +83,7 @@ def _workflow_expired(workflow: dict[str, Any]) -> bool:
 
 def _discard_workflow(context: ContextTypes.DEFAULT_TYPE) -> None:
     workflow = context.chat_data.pop("workflow", None)
-    if workflow and workflow.get("kind") in {"setup", "texts"}:
+    if workflow and workflow.get("kind") in {"setup", "texts", "email_group"}:
         context.chat_data.pop(workflow["kind"], None)
 
 
@@ -117,8 +124,7 @@ async def _workflow_available(
         workflow["touched_at"] = time.monotonic()
         return True
     await update.effective_message.reply_text(
-        "В этом чате другой администратор уже выполняет настройку. "
-        "Дождитесь её завершения."
+        "В этом чате другой администратор уже выполняет настройку. Дождитесь её завершения."
     )
     return False
 
@@ -175,10 +181,11 @@ async def _authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Я отправляю ежедневный дайджест проекта из GitHub или GitLab по расписанию.\n\n"
-        "Настройте рассылку командой /setup. В личном диалоге адресатом будете вы; "
-        "в группе — текущая группа. Изменить сохранённую рассылку можно командой "
-        "/edit ID. Команда /help покажет остальные возможности."
+        "Я отправляю ежедневный дайджест проекта из GitHub или GitLab по расписанию "
+        "в Telegram или по email.\n\nНастройте рассылку командой /setup. Для email "
+        "сначала создайте группу адресатов командой /emailgroup_add. Изменить "
+        "сохранённую рассылку можно командой /edit ID. Команда /help покажет "
+        "остальные возможности."
     )
 
 
@@ -192,6 +199,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/preview ID — показать сообщение за подходящую дату\n"
         "/stats [ID] — показать статистику доставок\n"
         "/texts ID — настроить обрамляющие тексты\n"
+        "/emailgroups — показать группы email-получателей\n"
+        "/emailgroup_add — создать группу email-получателей\n"
+        "/emailgroup_edit ID — изменить email-группу\n"
+        "/emailgroup_delete ID — удалить email-группу\n"
         "/delete ID — удалить рассылку\n"
         "/cancel — отменить текущую настройку\n\n"
         "Допустимое время: 00:00–13:59 (дайджест за вчера) или "
@@ -205,11 +216,17 @@ async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     workflow = context.chat_data.get("workflow")
     if workflow is not None and workflow.get("kind") != "setup":
         await update.effective_message.reply_text(
-            "Сначала завершите настройку текстов или отправьте /cancel."
+            "Сначала завершите текущую настройку или отправьте /cancel."
         )
         return _workflow_state(context)
     if not await _authorized(update, context):
         return ConversationHandler.END
+    settings: Settings = context.application.bot_data["settings"]
+    choices = [["Telegram"]]
+    channel_description = "Пока реализован только Telegram."
+    if settings.smtp is not None:
+        choices.append(["Email"])
+        channel_description = "Доступны Telegram и Email."
     context.chat_data["workflow"] = {
         "kind": "setup",
         "owner_user_id": update.effective_user.id,
@@ -218,11 +235,8 @@ async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     }
     context.chat_data["setup"] = {}
     await update.effective_message.reply_text(
-        "Выберите канал доставки. Пока реализован только Telegram; email и другие "
-        "каналы запланированы.",
-        reply_markup=ReplyKeyboardMarkup(
-            [["Telegram"]], one_time_keyboard=True, resize_keyboard=True
-        ),
+        f"Выберите канал доставки. {channel_description}",
+        reply_markup=ReplyKeyboardMarkup(choices, one_time_keyboard=True, resize_keyboard=True),
     )
     return CHANNEL
 
@@ -233,7 +247,7 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     workflow = context.chat_data.get("workflow")
     if workflow is not None and workflow.get("kind") != "setup":
         await update.effective_message.reply_text(
-            "Сначала завершите настройку текстов или отправьте /cancel."
+            "Сначала завершите текущую настройку или отправьте /cancel."
         )
         return _workflow_state(context)
     if not await _authorized(update, context):
@@ -248,6 +262,7 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     context.chat_data["setup"] = {
         "channel": subscription.channel,
+        "target": subscription.target,
         "repository": subscription.repository,
         "digest_path": subscription.digest_path,
         "ref": subscription.ref,
@@ -256,6 +271,15 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "send_time": subscription.send_time,
         "original": subscription,
     }
+    if subscription.channel == "email":
+        group = _storage(context).resolve_email_group_target(subscription.target)
+        if group is None:
+            context.chat_data.pop("setup", None)
+            await update.effective_message.reply_text(
+                "Группа получателей этой рассылки больше не существует."
+            )
+            return ConversationHandler.END
+        context.chat_data["setup"]["email_group_name"] = group.name
     context.chat_data["workflow"] = {
         "kind": "setup",
         "owner_user_id": update.effective_user.id,
@@ -264,8 +288,7 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     }
     await update.effective_message.reply_text(
         "Укажите новый репозиторий: GitHub owner/name либо полный HTTPS URL "
-        "GitHub/GitLab."
-        + _current_value(context, "repository"),
+        "GitHub/GitLab." + _current_value(context, "repository"),
         reply_markup=_step_markup(context),
     )
     return _set_workflow_state(context, REPOSITORY)
@@ -274,15 +297,55 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def channel_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _workflow_owned(update, context, "setup"):
         return ConversationHandler.END
-    if update.effective_message.text.casefold() != "telegram":
-        await update.effective_message.reply_text(
-            "Сейчас доступен только Telegram. Выберите Telegram."
+    channel = update.effective_message.text.strip().casefold()
+    settings: Settings = context.application.bot_data["settings"]
+    if channel == "email" and settings.smtp is not None:
+        groups = _storage(context).list_email_recipient_groups(str(update.effective_chat.id))
+        if not groups:
+            context.chat_data.pop("setup", None)
+            _release_workflow(update, context, "setup")
+            await update.effective_message.reply_text(
+                "Сначала создайте группу получателей командой /emailgroup_add, "
+                "затем повторите /setup.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return ConversationHandler.END
+        context.chat_data["setup"]["channel"] = "email"
+        lines = ["Выберите группу получателей, отправив её ID:"]
+        lines.extend(
+            f"#{group.id} · {group.name} · адресатов: {len(group.recipients)}" for group in groups
         )
+        await update.effective_message.reply_text(
+            "\n".join(lines), reply_markup=ReplyKeyboardRemove()
+        )
+        return _set_workflow_state(context, EMAIL_GROUP_SELECT)
+    if channel != "telegram":
+        await update.effective_message.reply_text("Выберите доступный канал кнопкой ниже.")
         return CHANNEL
     context.chat_data["setup"]["channel"] = "telegram"
+    context.chat_data["setup"]["target"] = str(update.effective_chat.id)
     await update.effective_message.reply_text(
         "Укажите репозиторий: GitHub owner/name либо полный HTTPS URL GitHub/GitLab.",
         reply_markup=ReplyKeyboardRemove(),
+    )
+    return _set_workflow_state(context, REPOSITORY)
+
+
+async def email_group_select_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _workflow_owned(update, context, "setup"):
+        return ConversationHandler.END
+    text = update.effective_message.text.strip()
+    if not text.isdigit():
+        await update.effective_message.reply_text("Отправьте числовой ID группы.")
+        return EMAIL_GROUP_SELECT
+    group = _storage(context).get_email_recipient_group(int(text), str(update.effective_chat.id))
+    if group is None:
+        await update.effective_message.reply_text("Группа получателей не найдена.")
+        return EMAIL_GROUP_SELECT
+    context.chat_data["setup"]["target"] = _storage(context).email_group_target(group.id)
+    context.chat_data["setup"]["email_group_name"] = group.name
+    await update.effective_message.reply_text(
+        "Укажите репозиторий: GitHub owner/name либо полный HTTPS URL GitHub/GitLab."
     )
     return _set_workflow_state(context, REPOSITORY)
 
@@ -302,8 +365,7 @@ async def repository_step(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.effective_message.reply_text(
         "Укажите путь к дайджесту внутри репозитория.\n\n"
         "Пример:\n"
-        "docs/project-digest.md"
-        + _current_value(context, "digest_path"),
+        "docs/project-digest.md" + _current_value(context, "digest_path"),
         reply_markup=_step_markup(context),
     )
     return _set_workflow_state(context, PATH)
@@ -319,8 +381,7 @@ async def path_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return PATH
     context.chat_data["setup"]["digest_path"] = digest_path
     await update.effective_message.reply_text(
-        "Выберите ветку main или введите другой Git ref."
-        + _current_value(context, "ref"),
+        "Выберите ветку main или введите другой Git ref." + _current_value(context, "ref"),
         reply_markup=_step_markup(context, "main"),
     )
     return _set_workflow_state(context, REF)
@@ -365,8 +426,7 @@ async def token_env_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     settings: Settings = context.application.bot_data["settings"]
     await update.effective_message.reply_text(
         "Выберите часовой пояс по умолчанию или введите другое имя IANA, "
-        "например Europe/Moscow."
-        + _current_value(context, "timezone"),
+        "например Europe/Moscow." + _current_value(context, "timezone"),
         reply_markup=_step_markup(context, settings.default_timezone),
     )
     return _set_workflow_state(context, TIMEZONE)
@@ -406,9 +466,13 @@ async def send_time_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     setup: dict[str, Any] = context.chat_data["setup"]
     setup["send_time"] = send_time
     access = setup["token_env"] or "публичный доступ"
+    if setup["channel"] == "email":
+        delivery = f"Email, группа «{setup['email_group_name']}»"
+    else:
+        delivery = "Telegram, текущий чат"
     await update.effective_message.reply_text(
         "Проверьте настройку:\n\n"
-        f"• Канал: Telegram, текущий чат\n"
+        f"• Канал: {delivery}\n"
         f"• Репозиторий: {setup['repository']}\n"
         f"• Файл: {setup['digest_path']}\n"
         f"• Ref: {setup['ref']}\n"
@@ -450,7 +514,7 @@ async def confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             Subscription(
                 id=None,
                 channel=setup["channel"],
-                target=str(update.effective_chat.id),
+                target=setup["target"],
                 repository=setup["repository"],
                 digest_path=setup["digest_path"],
                 ref=setup["ref"],
@@ -458,6 +522,7 @@ async def confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 timezone=setup["timezone"],
                 send_time=setup["send_time"],
                 created_by=update.effective_user.id,
+                control_target=str(update.effective_chat.id),
             )
         )
         result = f"Рассылка #{saved.id} сохранена."
@@ -475,6 +540,7 @@ async def confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 send_time=setup["send_time"],
                 created_by=original.created_by,
                 active=original.active,
+                control_target=original.control_target,
             )
         )
         if saved is None:
@@ -499,6 +565,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     elif _workflow_owned(update, context, "texts"):
         context.chat_data.pop("texts", None)
         _release_workflow(update, context, "texts")
+    elif _workflow_owned(update, context, "email_group"):
+        context.chat_data.pop("email_group", None)
+        _release_workflow(update, context, "email_group")
     else:
         await update.effective_message.reply_text(
             "Активная настройка принадлежит другому администратору.",
@@ -511,10 +580,265 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def emailgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context):
+        return
+    groups = _storage(context).list_email_recipient_groups(str(update.effective_chat.id))
+    if not groups:
+        await update.effective_message.reply_text(
+            "В этом чате пока нет групп email-получателей. "
+            "Создайте первую командой /emailgroup_add."
+        )
+        return
+    lines = ["Группы email-получателей:"]
+    lines.extend(
+        f"#{group.id} · {group.name} · адресатов: {len(group.recipients)}" for group in groups
+    )
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def emailgroup_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _workflow_available(update, context, "email_group"):
+        return ConversationHandler.END
+    workflow = context.chat_data.get("workflow")
+    if workflow is not None:
+        if workflow.get("kind") == "email_group":
+            await update.effective_message.reply_text(
+                "Сначала завершите текущую настройку группы или отправьте /cancel."
+            )
+        else:
+            await update.effective_message.reply_text(
+                "Сначала завершите текущую настройку или отправьте /cancel."
+            )
+        return _workflow_state(context)
+    if not await _authorized(update, context):
+        return ConversationHandler.END
+    context.chat_data["workflow"] = {
+        "kind": "email_group",
+        "owner_user_id": update.effective_user.id,
+        "touched_at": time.monotonic(),
+        "state": GROUP_NAME,
+    }
+    context.chat_data["email_group"] = {"mode": "add"}
+    await update.effective_message.reply_text(
+        "Укажите название группы email-получателей (1–64 символа).",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return GROUP_NAME
+
+
+async def emailgroup_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _workflow_available(update, context, "email_group"):
+        return ConversationHandler.END
+    if context.chat_data.get("workflow") is not None:
+        await update.effective_message.reply_text(
+            "Сначала завершите текущую настройку или отправьте /cancel."
+        )
+        return _workflow_state(context)
+    if not await _authorized(update, context):
+        return ConversationHandler.END
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Использование: /emailgroup_edit ID")
+        return ConversationHandler.END
+    group = _storage(context).get_email_recipient_group(
+        int(context.args[0]), str(update.effective_chat.id)
+    )
+    if group is None:
+        await update.effective_message.reply_text("Группа получателей не найдена.")
+        return ConversationHandler.END
+    context.chat_data["workflow"] = {
+        "kind": "email_group",
+        "owner_user_id": update.effective_user.id,
+        "touched_at": time.monotonic(),
+        "state": GROUP_NAME,
+    }
+    context.chat_data["email_group"] = {
+        "mode": "edit",
+        "original": group,
+        "name": group.name,
+        "recipients": group.recipients,
+    }
+    await update.effective_message.reply_text(
+        f"Укажите новое название группы.\n\nТекущее значение: {group.name}",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KEEP_VALUE]], one_time_keyboard=True, resize_keyboard=True
+        ),
+    )
+    return GROUP_NAME
+
+
+async def emailgroup_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _workflow_available(update, context, "email_group"):
+        return ConversationHandler.END
+    if context.chat_data.get("workflow") is not None:
+        await update.effective_message.reply_text(
+            "Сначала завершите текущую настройку или отправьте /cancel."
+        )
+        return _workflow_state(context)
+    if not await _authorized(update, context):
+        return ConversationHandler.END
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Использование: /emailgroup_delete ID")
+        return ConversationHandler.END
+    group = _storage(context).get_email_recipient_group(
+        int(context.args[0]), str(update.effective_chat.id)
+    )
+    if group is None:
+        await update.effective_message.reply_text("Группа получателей не найдена.")
+        return ConversationHandler.END
+    context.chat_data["workflow"] = {
+        "kind": "email_group",
+        "owner_user_id": update.effective_user.id,
+        "touched_at": time.monotonic(),
+        "state": GROUP_DELETE_CONFIRM,
+    }
+    context.chat_data["email_group"] = {"mode": "delete", "original": group}
+    await update.effective_message.reply_text(
+        f"Удалить группу #{group.id} «{group.name}»?",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Да", "Нет"]], one_time_keyboard=True, resize_keyboard=True
+        ),
+    )
+    return GROUP_DELETE_CONFIRM
+
+
+async def group_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _workflow_owned(update, context, "email_group"):
+        return ConversationHandler.END
+    data = context.chat_data["email_group"]
+    text = update.effective_message.text.strip()
+    name = data["name"] if data["mode"] == "edit" and text == KEEP_VALUE else " ".join(text.split())
+    if not 1 <= len(name) <= 64:
+        await update.effective_message.reply_text("Название должно содержать от 1 до 64 символов.")
+        return GROUP_NAME
+    data["name"] = name
+    suffix = ""
+    markup: ReplyKeyboardMarkup | ReplyKeyboardRemove = ReplyKeyboardRemove()
+    if data["mode"] == "edit":
+        suffix = " Выберите «Оставить без изменений», чтобы сохранить текущий список."
+        markup = ReplyKeyboardMarkup([[KEEP_VALUE]], one_time_keyboard=True, resize_keyboard=True)
+    await update.effective_message.reply_text(
+        "Отправьте email-адреса через запятую, точку с запятой или с новой строки. "
+        f"Допустимо от 1 до 100 адресатов.{suffix}",
+        reply_markup=markup,
+    )
+    return _set_workflow_state(context, GROUP_RECIPIENTS)
+
+
+async def group_recipients_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _workflow_owned(update, context, "email_group"):
+        return ConversationHandler.END
+    data = context.chat_data["email_group"]
+    text = update.effective_message.text.strip()
+    if data["mode"] == "edit" and text == KEEP_VALUE:
+        normalized = data["recipients"]
+    else:
+        recipients = re.split(r"[,;\n]+", text)
+        try:
+            normalized = _storage(context).normalize_email_recipients(recipients)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return GROUP_RECIPIENTS
+    data["recipients"] = normalized
+    await update.effective_message.reply_text(
+        f"Группа «{data['name']}», адресатов: {len(normalized)}. Сохранить?",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Да", "Нет"]], one_time_keyboard=True, resize_keyboard=True
+        ),
+    )
+    return _set_workflow_state(context, GROUP_CONFIRM)
+
+
+async def group_confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _workflow_owned(update, context, "email_group"):
+        return ConversationHandler.END
+    answer = update.effective_message.text.strip().casefold()
+    if answer not in {"да", "нет"}:
+        await update.effective_message.reply_text("Ответьте Да или Нет.")
+        return GROUP_CONFIRM
+    if answer == "нет":
+        context.chat_data.pop("email_group", None)
+        _release_workflow(update, context, "email_group")
+        await update.effective_message.reply_text(
+            "Настройка отменена.", reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
+    if not await _authorized(update, context):
+        context.chat_data.pop("email_group", None)
+        _release_workflow(update, context, "email_group")
+        return ConversationHandler.END
+    data = context.chat_data.pop("email_group")
+    try:
+        if data["mode"] == "edit":
+            group = _storage(context).update_email_recipient_group(
+                data["original"].id,
+                str(update.effective_chat.id),
+                data["name"],
+                list(data["recipients"]),
+            )
+            if group is None:
+                raise LookupError("Email group disappeared")
+        else:
+            group = _storage(context).add_email_recipient_group(
+                str(update.effective_chat.id),
+                update.effective_user.id,
+                data["name"],
+                list(data["recipients"]),
+            )
+    except sqlite3.IntegrityError:
+        _release_workflow(update, context, "email_group")
+        await update.effective_message.reply_text(
+            "Группа с таким названием уже существует.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    _release_workflow(update, context, "email_group")
+    await update.effective_message.reply_text(
+        f"Группа #{group.id} «{group.name}» сохранена.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+async def group_delete_confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _workflow_owned(update, context, "email_group"):
+        return ConversationHandler.END
+    answer = update.effective_message.text.strip().casefold()
+    if answer not in {"да", "нет"}:
+        await update.effective_message.reply_text("Ответьте Да или Нет.")
+        return GROUP_DELETE_CONFIRM
+    data = context.chat_data.pop("email_group")
+    if answer == "нет":
+        _release_workflow(update, context, "email_group")
+        await update.effective_message.reply_text(
+            "Удаление отменено.", reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
+    if not await _authorized(update, context):
+        _release_workflow(update, context, "email_group")
+        return ConversationHandler.END
+    try:
+        deleted = _storage(context).delete_email_recipient_group(
+            data["original"].id, str(update.effective_chat.id)
+        )
+    except ValueError:
+        _release_workflow(update, context, "email_group")
+        await update.effective_message.reply_text(
+            "Группа используется рассылкой. Сначала удалите или измените рассылку.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    _release_workflow(update, context, "email_group")
+    await update.effective_message.reply_text(
+        "Группа удалена." if deleted else "Группа получателей не найдена.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
 def _text_menu_markup() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[label] for label in TEXT_KIND_LABELS]
-        + [["Сбросить все тексты"], ["Сохранить"]],
+        [[label] for label in TEXT_KIND_LABELS] + [["Сбросить все тексты"], ["Сохранить"]],
         resize_keyboard=True,
     )
 
@@ -539,8 +863,7 @@ async def _show_text_menu(
     data = context.chat_data["texts"]
     variants = data["draft"]
     counts = {
-        kind: sum(1 for item in variants if item["kind"] == kind)
-        for kind in TEXT_KIND_TITLES
+        kind: sum(1 for item in variants if item["kind"] == kind) for kind in TEXT_KIND_TITLES
     }
     lines = [prefix] if prefix else []
     lines.append(f"Тексты рассылки #{data['subscription_id']}:")
@@ -569,8 +892,7 @@ async def _show_text_category(
     if current:
         lines.append("Свои варианты заменяют встроенные:")
         lines.extend(
-            f"#{item['id']} · вес {item['weight']} · {item['today_text'][:80]}"
-            for item in current
+            f"#{item['id']} · вес {item['weight']} · {item['today_text'][:80]}" for item in current
         )
     else:
         lines.append("Используются встроенные варианты.")
@@ -705,9 +1027,7 @@ async def text_action_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         data.pop("kind", None)
         return await _show_text_menu(update, context)
     if text == "Вернуть встроенные варианты":
-        data["draft"] = [
-            item for item in data["draft"] if item["kind"] != data["kind"]
-        ]
+        data["draft"] = [item for item in data["draft"] if item["kind"] != data["kind"]]
         return await _show_text_category(
             update,
             context,
@@ -949,15 +1269,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_application(settings: Settings) -> Application:
     storage = Storage(settings.database_path)
     storage.initialize()
-    source = RepositoryContentsSource(
-        allowed_gitlab_hosts=settings.gitlab_allowed_hosts
-    )
+    if settings.smtp is None and any(
+        item.channel == "email" for item in storage.list_subscriptions()
+    ):
+        raise RuntimeError("SMTP is required while email subscriptions exist")
+    source = RepositoryContentsSource(allowed_gitlab_hosts=settings.gitlab_allowed_hosts)
 
     async def post_init(application: Application) -> None:
+        channels = {"telegram": TelegramChannel(application.bot)}
+        if settings.smtp is not None:
+            channels["email"] = EmailChannel(storage, settings.smtp)
         service = DeliveryService(
             storage=storage,
             source=source,
-            channels={"telegram": TelegramChannel(application.bot)},
+            channels=channels,
             retry_policy=RetryPolicy(
                 max_attempts=settings.delivery_max_attempts,
                 initial_delay_seconds=settings.delivery_retry_initial_seconds,
@@ -980,6 +1305,10 @@ def build_application(settings: Settings) -> Application:
                 BotCommand("preview", "проверить сообщение"),
                 BotCommand("stats", "статистика доставок"),
                 BotCommand("texts", "настроить тексты"),
+                BotCommand("emailgroups", "показать email-группы"),
+                BotCommand("emailgroup_add", "создать email-группу"),
+                BotCommand("emailgroup_edit", "изменить email-группу"),
+                BotCommand("emailgroup_delete", "удалить email-группу"),
                 BotCommand("delete", "удалить рассылку"),
                 BotCommand("help", "помощь"),
             ]
@@ -1002,16 +1331,16 @@ def build_application(settings: Settings) -> Application:
             settings.telegram_proxy_url
         )
     application = (
-        builder.concurrent_updates(False)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
+        builder.concurrent_updates(False).post_init(post_init).post_shutdown(post_shutdown).build()
     )
     conversation = ConversationHandler(
         entry_points=[
             CommandHandler("setup", setup_start),
             CommandHandler("edit", edit_start),
             CommandHandler("texts", texts_start),
+            CommandHandler("emailgroup_add", emailgroup_add_start),
+            CommandHandler("emailgroup_edit", emailgroup_edit_start),
+            CommandHandler("emailgroup_delete", emailgroup_delete_start),
         ],
         states={
             CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, channel_step)],
@@ -1022,22 +1351,23 @@ def build_application(settings: Settings) -> Application:
             TIMEZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, timezone_step)],
             SEND_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_time_step)],
             CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_step)],
+            EMAIL_GROUP_SELECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, email_group_select_step)
+            ],
+            GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_name_step)],
+            GROUP_RECIPIENTS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, group_recipients_step)
+            ],
+            GROUP_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_confirm_step)],
+            GROUP_DELETE_CONFIRM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, group_delete_confirm_step)
+            ],
             TEXT_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, text_menu_step)],
-            TEXT_ACTION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, text_action_step)
-            ],
-            TEXT_TODAY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, text_today_step)
-            ],
-            TEXT_YESTERDAY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, text_yesterday_step)
-            ],
-            TEXT_WEIGHT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, text_weight_step)
-            ],
-            TEXT_DELETE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, text_delete_step)
-            ],
+            TEXT_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, text_action_step)],
+            TEXT_TODAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, text_today_step)],
+            TEXT_YESTERDAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, text_yesterday_step)],
+            TEXT_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, text_weight_step)],
+            TEXT_DELETE: [MessageHandler(filters.TEXT & ~filters.COMMAND, text_delete_step)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
@@ -1051,5 +1381,6 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("preview", preview_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("emailgroups", emailgroups_command))
     application.add_error_handler(error_handler)
     return application

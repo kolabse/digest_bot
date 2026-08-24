@@ -4,4 +4,10 @@ from typing import Protocol
 
 
 class DeliveryChannel(Protocol):
-    async def send(self, target: str, message: str) -> None: ...
+    async def send(
+        self,
+        target: str,
+        message: str,
+        *,
+        delivery_key: str | None = None,
+    ) -> None: ...

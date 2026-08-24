@@ -14,7 +14,13 @@ class TelegramChannel:
     def __init__(self, bot: Bot) -> None:
         self._bot = bot
 
-    async def send(self, target: str, message: str) -> None:
+    async def send(
+        self,
+        target: str,
+        message: str,
+        *,
+        delivery_key: str | None = None,
+    ) -> None:
         try:
             for chunk in split_message(message):
                 await self._bot.send_message(

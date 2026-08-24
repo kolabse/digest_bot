@@ -23,7 +23,13 @@ class FakeChannel:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
 
-    async def send(self, target: str, message: str) -> None:
+    async def send(
+        self,
+        target: str,
+        message: str,
+        *,
+        delivery_key: str | None = None,
+    ) -> None:
         self.messages.append((target, message))
 
 
@@ -33,11 +39,17 @@ class FailingChannel(FakeChannel):
         self.failures = failures
         self.attempts = 0
 
-    async def send(self, target: str, message: str) -> None:
+    async def send(
+        self,
+        target: str,
+        message: str,
+        *,
+        delivery_key: str | None = None,
+    ) -> None:
         self.attempts += 1
         if self.failures:
             raise self.failures.pop(0)
-        await super().send(target, message)
+        await super().send(target, message, delivery_key=delivery_key)
 
 
 def test_retry_policy_uses_exponential_backoff_with_cap() -> None:
@@ -133,14 +145,17 @@ async def test_preview_matches_delivery_with_custom_texts(tmp_path) -> None:
         )
     )
     assert saved.id is not None
-    assert storage.add_message_variant(
-        saved.id,
-        saved.target,
-        "intro",
-        "Свои новости сегодня:",
-        "Свои новости вчера:",
-        5,
-    ) is not None
+    assert (
+        storage.add_message_variant(
+            saved.id,
+            saved.target,
+            "intro",
+            "Свои новости сегодня:",
+            "Свои новости вчера:",
+            5,
+        )
+        is not None
+    )
     channel = FakeChannel()
     service = DeliveryService(storage, FakeSource(), {"telegram": channel})
     now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
@@ -249,9 +264,7 @@ async def test_provider_retry_delay_overrides_backoff(tmp_path) -> None:
         )
     )
     assert saved.id is not None
-    channel = FailingChannel(
-        [RetryableDeliveryError("limited", retry_after_seconds=180)]
-    )
+    channel = FailingChannel([RetryableDeliveryError("limited", retry_after_seconds=180)])
     policy = RetryPolicy(initial_delay_seconds=60, max_delay_seconds=60)
     service = DeliveryService(storage, FakeSource(), {"telegram": channel}, policy)
     now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
@@ -316,9 +329,7 @@ async def test_permanent_notification_failure_is_not_retried_recursively(tmp_pat
             created_by=42,
         )
     )
-    channel = FailingChannel(
-        [PermanentDeliveryError("digest"), PermanentDeliveryError("alert")]
-    )
+    channel = FailingChannel([PermanentDeliveryError("digest"), PermanentDeliveryError("alert")])
     service = DeliveryService(storage, FakeSource(), {"telegram": channel})
     now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
 
@@ -349,9 +360,7 @@ async def test_retryable_failure_stops_at_attempt_limit(tmp_path) -> None:
         )
     )
     assert saved.id is not None
-    channel = FailingChannel(
-        [RetryableDeliveryError("one"), RetryableDeliveryError("two")]
-    )
+    channel = FailingChannel([RetryableDeliveryError("one"), RetryableDeliveryError("two")])
     policy = RetryPolicy(max_attempts=2, initial_delay_seconds=60, max_delay_seconds=60)
     service = DeliveryService(storage, FakeSource(), {"telegram": channel}, policy)
     now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
@@ -442,11 +451,14 @@ async def test_stale_last_notification_attempt_is_logged(tmp_path, caplog) -> No
         next_attempt_at=None,
         reason="permanent_error",
     )
-    assert storage.claim_failure_notification(
-        now,
-        max_attempts=1,
-        stale_after=timedelta(minutes=1),
-    ) is not None
+    assert (
+        storage.claim_failure_notification(
+            now,
+            max_attempts=1,
+            stale_after=timedelta(minutes=1),
+        )
+        is not None
+    )
     service = DeliveryService(
         storage,
         FakeSource(),
@@ -501,11 +513,14 @@ async def test_notification_backoff_uses_fresh_time_after_slow_failure(tmp_path)
 
     await service._dispatch_failure_notifications(None)
 
-    assert storage.claim_failure_notification(
-        failure_time + timedelta(seconds=59),
-        max_attempts=policy.max_attempts,
-        stale_after=timedelta(seconds=policy.claim_lease_seconds),
-    ) is None
+    assert (
+        storage.claim_failure_notification(
+            failure_time + timedelta(seconds=59),
+            max_attempts=policy.max_attempts,
+            stale_after=timedelta(seconds=policy.claim_lease_seconds),
+        )
+        is None
+    )
     retry = storage.claim_failure_notification(
         failure_time + timedelta(minutes=1),
         max_attempts=policy.max_attempts,
