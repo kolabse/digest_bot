@@ -11,7 +11,7 @@ from digest_bot.migrations import (
     UnsupportedSchemaVersionError,
 )
 from digest_bot.models import Subscription
-from digest_bot.storage import Storage
+from digest_bot.storage import StaleMessageVariantsError, Storage
 
 LEGACY_SCHEMA = """
 CREATE TABLE subscriptions (
@@ -214,7 +214,119 @@ def test_initialization_creates_current_schema_and_is_idempotent(tmp_path) -> No
             "subscriptions",
             "deliveries",
             "delivery_failure_notifications",
+            "message_variants",
         } <= tables
+
+
+def test_message_variant_crud_is_scoped_to_subscription_chat(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+
+    variant = storage.add_message_variant(
+        saved.id,
+        "123",
+        "intro",
+        "Новости за сегодня:",
+        "Новости за вчера:",
+        5,
+    )
+
+    assert variant is not None
+    assert variant.id is not None
+    assert storage.list_message_variants(saved.id, target="123") == [variant]
+    assert storage.list_message_variants(saved.id, target="999") is None
+    assert not storage.delete_message_variant(saved.id, "999", variant.id, "intro")
+    fallback = storage.add_message_variant(
+        saved.id,
+        "123",
+        "fallback",
+        "Сегодня тихо",
+        "Вчера было тихо",
+        1,
+    )
+    assert fallback is not None
+    assert fallback.id is not None
+    assert not storage.delete_message_variant(saved.id, "123", fallback.id, "intro")
+    assert storage.clear_message_variants(saved.id, "123", kind="intro") == 1
+    assert storage.list_message_variants(saved.id, target="123") == [fallback]
+
+
+def test_replace_message_variants_is_atomic_and_scoped(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+
+    replaced = storage.replace_message_variants(
+        saved.id,
+        "123",
+        [
+            ("intro", "Сегодня", "Вчера", 5),
+            ("fallback", "Тихо сегодня", "Тихо вчера", 1),
+        ],
+    )
+
+    assert replaced is not None
+    assert [item.kind for item in replaced] == ["fallback", "intro"]
+    assert storage.replace_message_variants(saved.id, "999", []) is None
+    assert storage.list_message_variants(saved.id, target="123") == replaced
+
+
+def test_replace_message_variants_rejects_stale_draft(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+    original = storage.list_message_variants(saved.id, target="123")
+    assert original == []
+    revision = storage.message_variants_revision(original)
+
+    storage.replace_message_variants(
+        saved.id,
+        "123",
+        [("intro", "Первое изменение", "Первое изменение", 1)],
+        expected_revision=revision,
+    )
+
+    with pytest.raises(StaleMessageVariantsError):
+        storage.replace_message_variants(
+            saved.id,
+            "123",
+            [("intro", "Второе изменение", "Второе изменение", 1)],
+            expected_revision=revision,
+        )
+
+
+def test_message_variant_validation_and_limit(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(subscription())
+    assert saved.id is not None
+
+    with pytest.raises(ValueError, match="1 to 500"):
+        storage.add_message_variant(saved.id, "123", "intro", "", "yesterday", 1)
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        storage.add_message_variant(saved.id, "123", "intro", "today", "yesterday", 0)
+    for index in range(20):
+        assert storage.add_message_variant(
+            saved.id,
+            "123",
+            "intro",
+            f"today {index}",
+            f"yesterday {index}",
+            1,
+        ) is not None
+    with pytest.raises(ValueError, match="at most 20"):
+        storage.add_message_variant(
+            saved.id,
+            "123",
+            "intro",
+            "one too many",
+            "one too many",
+            1,
+        )
 
 
 def test_version_2_migration_preserves_deliveries_and_adds_empty_outbox(tmp_path) -> None:
@@ -252,10 +364,13 @@ def test_version_2_migration_preserves_deliveries_and_adds_empty_outbox(tmp_path
     assert record is not None
     assert record.status == "sent"
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
+            LATEST_SCHEMA_VERSION
+        )
         assert connection.execute(
             "SELECT COUNT(*) FROM delivery_failure_notifications"
         ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM message_variants").fetchone()[0] == 0
 
 
 def test_delivery_stats_are_scoped_and_include_latest_record(tmp_path) -> None:

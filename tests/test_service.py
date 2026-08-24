@@ -115,6 +115,44 @@ async def test_preview_works_during_quiet_window(tmp_path) -> None:
     assert "Дайджест доставлен" in message
 
 
+async def test_preview_matches_delivery_with_custom_texts(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = storage.add_subscription(
+        Subscription(
+            id=None,
+            channel="telegram",
+            target="123",
+            repository="owner/repo",
+            digest_path="docs/project-digest.md",
+            ref="main",
+            token_env=None,
+            timezone="UTC",
+            send_time="08:00",
+            created_by=42,
+        )
+    )
+    assert saved.id is not None
+    assert storage.add_message_variant(
+        saved.id,
+        saved.target,
+        "intro",
+        "Свои новости сегодня:",
+        "Свои новости вчера:",
+        5,
+    ) is not None
+    channel = FakeChannel()
+    service = DeliveryService(storage, FakeSource(), {"telegram": channel})
+    now = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
+
+    preview = await service.preview(saved.id, saved.target, now=now)
+    await service.dispatch_due(now)
+
+    assert len(channel.messages) == 1
+    assert channel.messages[0][1] == preview
+    assert "Свои новости вчера" in preview
+
+
 async def test_paused_subscription_is_not_dispatched(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     storage.initialize()

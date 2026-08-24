@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+MESSAGE_VARIANT_KINDS = frozenset(
+    {"intro", "fallback", "outro_small", "outro_regular", "outro_large"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Subscription:
@@ -69,3 +73,13 @@ class FailureNotificationClaim:
     delivery_attempt_count: int
     attempt_count: int
     token: str
+
+
+@dataclass(frozen=True, slots=True)
+class MessageVariant:
+    id: int | None
+    subscription_id: int
+    kind: str
+    today_text: str
+    yesterday_text: str
+    weight: int
