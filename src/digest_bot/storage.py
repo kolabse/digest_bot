@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
@@ -9,12 +11,18 @@ from pathlib import Path
 
 from .migrations import migrate
 from .models import (
+    MESSAGE_VARIANT_KINDS,
     DeliveryClaim,
     DeliveryRecord,
     DeliveryStats,
     FailureNotificationClaim,
+    MessageVariant,
     Subscription,
 )
+
+
+class StaleMessageVariantsError(RuntimeError):
+    pass
 
 
 class Storage:
@@ -22,11 +30,13 @@ class Storage:
         self.path = path
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
+            if immediate:
+                connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         finally:
@@ -168,6 +178,220 @@ class Storage:
                 (subscription_id, target),
             )
             return cursor.rowcount > 0
+
+    @staticmethod
+    def _message_variant_from_row(row: sqlite3.Row) -> MessageVariant:
+        return MessageVariant(
+            id=int(row["id"]),
+            subscription_id=int(row["subscription_id"]),
+            kind=str(row["kind"]),
+            today_text=str(row["today_text"]),
+            yesterday_text=str(row["yesterday_text"]),
+            weight=int(row["weight"]),
+        )
+
+    def list_message_variants(
+        self,
+        subscription_id: int,
+        *,
+        target: str | None = None,
+    ) -> list[MessageVariant] | None:
+        with self._connect() as connection:
+            if target is not None:
+                exists = connection.execute(
+                    "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                    (subscription_id, target),
+                ).fetchone()
+                if exists is None:
+                    return None
+            rows = connection.execute(
+                """
+                SELECT * FROM message_variants
+                WHERE subscription_id = ?
+                ORDER BY kind, id
+                """,
+                (subscription_id,),
+            )
+            return [self._message_variant_from_row(row) for row in rows]
+
+    @staticmethod
+    def message_variants_revision(variants: list[MessageVariant]) -> str:
+        payload = [
+            (item.kind, item.today_text, item.yesterday_text, item.weight)
+            for item in variants
+        ]
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def add_message_variant(
+        self,
+        subscription_id: int,
+        target: str,
+        kind: str,
+        today_text: str,
+        yesterday_text: str,
+        weight: int,
+    ) -> MessageVariant | None:
+        today_text = today_text.strip()
+        yesterday_text = yesterday_text.strip()
+        if kind not in MESSAGE_VARIANT_KINDS:
+            raise ValueError("Unknown message variant kind")
+        if not 1 <= len(today_text) <= 500 or not 1 <= len(yesterday_text) <= 500:
+            raise ValueError("Message variant text must contain 1 to 500 characters")
+        if not 1 <= weight <= 100:
+            raise ValueError("Message variant weight must be between 1 and 100")
+        with self._connect(immediate=True) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                (subscription_id, target),
+            ).fetchone()
+            if exists is None:
+                return None
+            count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM message_variants
+                    WHERE subscription_id = ? AND kind = ?
+                    """,
+                    (subscription_id, kind),
+                ).fetchone()[0]
+            )
+            if count >= 20:
+                raise ValueError("A message category can contain at most 20 variants")
+            cursor = connection.execute(
+                """
+                INSERT INTO message_variants (
+                    subscription_id, kind, today_text, yesterday_text, weight
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (subscription_id, kind, today_text, yesterday_text, weight),
+            )
+            variant_id = int(cursor.lastrowid or 0)
+            row = connection.execute(
+                "SELECT * FROM message_variants WHERE id = ?",
+                (variant_id,),
+            ).fetchone()
+            return self._message_variant_from_row(row)
+
+    def delete_message_variant(
+        self,
+        subscription_id: int,
+        target: str,
+        variant_id: int,
+        kind: str,
+    ) -> bool:
+        if kind not in MESSAGE_VARIANT_KINDS:
+            raise ValueError("Unknown message variant kind")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM message_variants
+                WHERE id = ? AND subscription_id = ? AND kind = ?
+                  AND EXISTS (
+                    SELECT 1 FROM subscriptions
+                    WHERE id = ? AND target = ?
+                  )
+                """,
+                (variant_id, subscription_id, kind, subscription_id, target),
+            )
+            return cursor.rowcount > 0
+
+    def clear_message_variants(
+        self,
+        subscription_id: int,
+        target: str,
+        *,
+        kind: str | None = None,
+    ) -> int | None:
+        if kind is not None and kind not in MESSAGE_VARIANT_KINDS:
+            raise ValueError("Unknown message variant kind")
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                (subscription_id, target),
+            ).fetchone()
+            if exists is None:
+                return None
+            params: list[object] = [subscription_id]
+            condition = ""
+            if kind is not None:
+                condition = " AND kind = ?"
+                params.append(kind)
+            cursor = connection.execute(
+                f"DELETE FROM message_variants WHERE subscription_id = ?{condition}",
+                params,
+            )
+            return cursor.rowcount
+
+    def replace_message_variants(
+        self,
+        subscription_id: int,
+        target: str,
+        variants: list[tuple[str, str, str, int]],
+        *,
+        expected_revision: str | None = None,
+    ) -> list[MessageVariant] | None:
+        counts: dict[str, int] = {}
+        normalized: list[tuple[str, str, str, int]] = []
+        for kind, today_text, yesterday_text, weight in variants:
+            today_text = today_text.strip()
+            yesterday_text = yesterday_text.strip()
+            if kind not in MESSAGE_VARIANT_KINDS:
+                raise ValueError("Unknown message variant kind")
+            if not 1 <= len(today_text) <= 500 or not 1 <= len(yesterday_text) <= 500:
+                raise ValueError("Message variant text must contain 1 to 500 characters")
+            if not 1 <= weight <= 100:
+                raise ValueError("Message variant weight must be between 1 and 100")
+            counts[kind] = counts.get(kind, 0) + 1
+            if counts[kind] > 20:
+                raise ValueError("A message category can contain at most 20 variants")
+            normalized.append((kind, today_text, yesterday_text, weight))
+        with self._connect(immediate=True) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                (subscription_id, target),
+            ).fetchone()
+            if exists is None:
+                return None
+            current_rows = connection.execute(
+                """
+                SELECT * FROM message_variants
+                WHERE subscription_id = ? ORDER BY kind, id
+                """,
+                (subscription_id,),
+            ).fetchall()
+            current = [self._message_variant_from_row(row) for row in current_rows]
+            if (
+                expected_revision is not None
+                and self.message_variants_revision(current) != expected_revision
+            ):
+                raise StaleMessageVariantsError(
+                    "Message variants changed after the draft was opened"
+                )
+            connection.execute(
+                "DELETE FROM message_variants WHERE subscription_id = ?",
+                (subscription_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO message_variants (
+                    subscription_id, kind, today_text, yesterday_text, weight
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (subscription_id, kind, today, yesterday, weight)
+                    for kind, today, yesterday, weight in normalized
+                ],
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM message_variants
+                WHERE subscription_id = ? ORDER BY kind, id
+                """,
+                (subscription_id,),
+            )
+            return [self._message_variant_from_row(row) for row in rows]
 
     @staticmethod
     def _delivery_from_row(row: sqlite3.Row) -> DeliveryRecord:

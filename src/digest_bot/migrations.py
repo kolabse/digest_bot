@@ -127,6 +127,25 @@ CREATE INDEX delivery_failure_notifications_due_idx
 ON delivery_failure_notifications (status, next_attempt_at, lease_expires_at)
 """
 
+MESSAGE_VARIANTS_SCHEMA = """
+CREATE TABLE message_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (
+        kind IN ('intro', 'fallback', 'outro_small', 'outro_regular', 'outro_large')
+    ),
+    today_text TEXT NOT NULL CHECK (length(today_text) BETWEEN 1 AND 500),
+    yesterday_text TEXT NOT NULL CHECK (length(yesterday_text) BETWEEN 1 AND 500),
+    weight INTEGER NOT NULL CHECK (weight BETWEEN 1 AND 100),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+MESSAGE_VARIANTS_INDEX = """
+CREATE INDEX message_variants_subscription_kind_idx
+ON message_variants (subscription_id, kind, id)
+"""
+
 def _normalize_schema_sql(value: str) -> str:
     return " ".join(value.split()).casefold()
 
@@ -157,6 +176,28 @@ _EXPECTED_SCHEMAS = {
         ),
         ("index", "delivery_failure_notifications_due_idx"): _normalize_schema_sql(
             FAILURE_NOTIFICATIONS_DUE_INDEX
+        ),
+    },
+    4: {
+        ("table", "subscriptions"): _normalize_schema_sql(SUBSCRIPTIONS_SCHEMA),
+        ("table", "deliveries"): _normalize_schema_sql(DELIVERIES_SCHEMA),
+        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(
+            DELIVERIES_RETRY_INDEX
+        ),
+        ("index", "deliveries_retention_idx"): _normalize_schema_sql(
+            DELIVERIES_RETENTION_INDEX
+        ),
+        ("table", "delivery_failure_notifications"): _normalize_schema_sql(
+            FAILURE_NOTIFICATIONS_SCHEMA
+        ),
+        ("index", "delivery_failure_notifications_due_idx"): _normalize_schema_sql(
+            FAILURE_NOTIFICATIONS_DUE_INDEX
+        ),
+        ("table", "message_variants"): _normalize_schema_sql(
+            MESSAGE_VARIANTS_SCHEMA
+        ),
+        ("index", "message_variants_subscription_kind_idx"): _normalize_schema_sql(
+            MESSAGE_VARIANTS_INDEX
         ),
     },
 }
@@ -241,10 +282,17 @@ def _migrate_to_version_3(connection: sqlite3.Connection) -> None:
     connection.execute(FAILURE_NOTIFICATIONS_DUE_INDEX)
 
 
+def _migrate_to_version_4(connection: sqlite3.Connection) -> None:
+    _validate_schema(connection, 3, "version 3")
+    connection.execute(MESSAGE_VARIANTS_SCHEMA)
+    connection.execute(MESSAGE_VARIANTS_INDEX)
+
+
 MIGRATIONS: dict[int, Migration] = {
     1: _migrate_to_version_1,
     2: _migrate_to_version_2,
     3: _migrate_to_version_3,
+    4: _migrate_to_version_4,
 }
 LATEST_SCHEMA_VERSION = max(MIGRATIONS)
 

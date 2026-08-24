@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,8 +13,16 @@ from digest_bot.bot import (
     REF,
     REPOSITORY,
     SEND_TIME,
+    TEXT_ACTION,
+    TEXT_DELETE,
+    TEXT_MENU,
+    TEXT_TODAY,
+    TEXT_WEIGHT,
+    TEXT_YESTERDAY,
     TIMEZONE,
     TOKEN_ENV,
+    cancel,
+    channel_step,
     confirm_step,
     edit_start,
     list_command,
@@ -23,7 +32,15 @@ from digest_bot.bot import (
     repository_step,
     resume_command,
     send_time_step,
+    setup_start,
     stats_command,
+    text_action_step,
+    text_delete_step,
+    text_menu_step,
+    text_today_step,
+    text_weight_step,
+    text_yesterday_step,
+    texts_start,
     timezone_step,
     token_env_step,
 )
@@ -71,6 +88,7 @@ def make_context(storage: Storage, *args: str) -> SimpleNamespace:
     return SimpleNamespace(
         args=list(args),
         user_data={},
+        chat_data={},
         application=SimpleNamespace(bot_data={"storage": storage, "settings": settings}),
     )
 
@@ -144,7 +162,7 @@ async def test_edit_does_not_reveal_subscription_from_another_chat(tmp_path) -> 
 
     assert await edit_start(update, context) == ConversationHandler.END
     assert update.effective_message.replies[-1][0] == "Рассылка не найдена."
-    assert "setup" not in context.user_data
+    assert "setup" not in context.chat_data
 
 
 async def test_edit_requires_exactly_one_numeric_id(tmp_path) -> None:
@@ -260,6 +278,321 @@ async def test_stats_rejects_invalid_arguments(tmp_path, args) -> None:
     await stats_command(update, make_context(storage, *args))
 
     assert update.effective_message.replies[-1][0] == "Использование: /stats [ID]"
+
+
+async def test_texts_dialog_adds_and_deletes_variant(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    context = make_context(storage, str(saved.id))
+
+    assert await texts_start(update, context) == TEXT_MENU
+    update.effective_message.text = "Вступление"
+    assert await text_menu_step(update, context) == TEXT_ACTION
+    update.effective_message.text = "Добавить вариант"
+    assert await text_action_step(update, context) == TEXT_TODAY
+    update.effective_message.text = "Сегодня есть новости"
+    assert await text_today_step(update, context) == TEXT_YESTERDAY
+    update.effective_message.text = "Вчера были новости"
+    assert await text_yesterday_step(update, context) == TEXT_WEIGHT
+    update.effective_message.text = "5"
+    assert await text_weight_step(update, context) == TEXT_ACTION
+
+    assert storage.list_message_variants(saved.id, target=saved.target) == []
+    update.effective_message.text = "Назад"
+    assert await text_action_step(update, context) == TEXT_MENU
+    update.effective_message.text = "Сохранить"
+    assert await text_menu_step(update, context) == ConversationHandler.END
+    variants = storage.list_message_variants(saved.id, target=saved.target)
+    assert variants is not None
+    assert len(variants) == 1
+    assert variants[0].today_text == "Сегодня есть новости"
+    variant_id = variants[0].id
+    assert variant_id is not None
+
+    context = make_context(storage, str(saved.id))
+    assert await texts_start(update, context) == TEXT_MENU
+    update.effective_message.text = "Вступление"
+    assert await text_menu_step(update, context) == TEXT_ACTION
+    update.effective_message.text = "Удалить вариант"
+    assert await text_action_step(update, context) == TEXT_DELETE
+    update.effective_message.text = str(variant_id)
+    assert await text_delete_step(update, context) == TEXT_ACTION
+    update.effective_message.text = "Назад"
+    assert await text_action_step(update, context) == TEXT_MENU
+    update.effective_message.text = "Сохранить"
+    assert await text_menu_step(update, context) == ConversationHandler.END
+    assert storage.list_message_variants(saved.id, target=saved.target) == []
+
+
+async def test_texts_dialog_can_delete_unsaved_variant(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    context = make_context(storage, str(saved.id))
+
+    assert await texts_start(update, context) == TEXT_MENU
+    update.effective_message.text = "Вступление"
+    assert await text_menu_step(update, context) == TEXT_ACTION
+    update.effective_message.text = "Добавить вариант"
+    assert await text_action_step(update, context) == TEXT_TODAY
+    update.effective_message.text = "Сегодня"
+    assert await text_today_step(update, context) == TEXT_YESTERDAY
+    update.effective_message.text = "Вчера"
+    assert await text_yesterday_step(update, context) == TEXT_WEIGHT
+    update.effective_message.text = "1"
+    assert await text_weight_step(update, context) == TEXT_ACTION
+    update.effective_message.text = "Удалить вариант"
+    assert await text_action_step(update, context) == TEXT_DELETE
+    update.effective_message.text = "-1"
+    assert await text_delete_step(update, context) == TEXT_ACTION
+
+    assert context.chat_data["texts"]["draft"] == []
+
+
+async def test_texts_cancel_discards_draft(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    context = make_context(storage, str(saved.id))
+    assert await texts_start(update, context) == TEXT_MENU
+    update.effective_message.text = "Вступление"
+    assert await text_menu_step(update, context) == TEXT_ACTION
+    update.effective_message.text = "Добавить вариант"
+    assert await text_action_step(update, context) == TEXT_TODAY
+    update.effective_message.text = "Сегодня"
+    assert await text_today_step(update, context) == TEXT_YESTERDAY
+    update.effective_message.text = "Вчера"
+    assert await text_yesterday_step(update, context) == TEXT_WEIGHT
+    update.effective_message.text = "1"
+    assert await text_weight_step(update, context) == TEXT_ACTION
+
+    assert await cancel(update, context) == ConversationHandler.END
+    assert storage.list_message_variants(saved.id, target=saved.target) == []
+
+
+async def test_texts_dialog_does_not_reveal_foreign_subscription(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    update.effective_chat.id = 999
+
+    result = await texts_start(update, make_context(storage, str(saved.id)))
+
+    assert result == ConversationHandler.END
+    assert update.effective_message.replies[-1][0] == "Рассылка не найдена."
+
+
+async def test_setup_and_texts_dialogs_cannot_overlap(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    context = make_context(storage)
+
+    assert await setup_start(update, context) == 0
+    context.args = [str(saved.id)]
+    assert await texts_start(update, context) == 0
+    assert "Сначала завершите текущую настройку" in update.effective_message.replies[-1][0]
+
+    update.effective_message.text = "/cancel"
+    assert await cancel(update, context) == ConversationHandler.END
+    assert await texts_start(update, context) == TEXT_MENU
+    assert await setup_start(update, context) == TEXT_MENU
+    assert "Сначала завершите настройку текстов" in update.effective_message.replies[-1][0]
+    assert await cancel(update, context) == ConversationHandler.END
+    assert "workflow" not in context.chat_data
+    assert "texts" not in context.chat_data
+
+
+async def test_rejected_texts_reentry_preserves_current_setup_step(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    context = make_context(storage)
+
+    assert await setup_start(update, context) == 0
+    update.effective_message.text = "Telegram"
+    assert await channel_step(update, context) == REPOSITORY
+    context.args = [str(saved.id)]
+    assert await texts_start(update, context) == REPOSITORY
+    update.effective_message.text = "owner/another-repo"
+    assert await repository_step(update, context) == PATH
+
+
+async def test_setup_drafts_are_isolated_between_chats_for_same_user(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    first_update = make_update()
+    second_update = make_update()
+    second_update.effective_chat.id = 999
+    shared_user_data: dict[str, object] = {}
+    first_context = make_context(storage)
+    second_context = make_context(storage)
+    first_context.user_data = shared_user_data
+    second_context.user_data = shared_user_data
+
+    assert await setup_start(first_update, first_context) == 0
+    assert await setup_start(second_update, second_context) == 0
+    first_update.effective_message.text = "Telegram"
+    second_update.effective_message.text = "Telegram"
+    assert await channel_step(first_update, first_context) == REPOSITORY
+    assert await channel_step(second_update, second_context) == REPOSITORY
+    first_update.effective_message.text = "first/repo"
+    second_update.effective_message.text = "second/repo"
+    assert await repository_step(first_update, first_context) == PATH
+    assert await repository_step(second_update, second_context) == PATH
+
+    assert first_context.chat_data["setup"]["repository"] == "first/repo"
+    assert second_context.chat_data["setup"]["repository"] == "second/repo"
+    assert shared_user_data == {}
+
+
+async def test_edit_save_rechecks_authorization(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    context = make_context(storage, str(saved.id))
+
+    assert await edit_start(update, context) == REPOSITORY
+    update.effective_message.text = KEEP_VALUE
+    assert await repository_step(update, context) == PATH
+    update.effective_message.text = "docs/forbidden.md"
+    assert await path_step(update, context) == REF
+    update.effective_message.text = KEEP_VALUE
+    assert await ref_step(update, context) == TOKEN_ENV
+    update.effective_message.text = KEEP_VALUE
+    assert await token_env_step(update, context) == TIMEZONE
+    update.effective_message.text = KEEP_VALUE
+    assert await timezone_step(update, context) == SEND_TIME
+    update.effective_message.text = KEEP_VALUE
+    assert await send_time_step(update, context) == CONFIRM
+    context.application.bot_data["settings"] = replace(
+        context.application.bot_data["settings"], admin_user_ids=frozenset({99})
+    )
+    update.effective_message.text = "Да"
+
+    assert await confirm_step(update, context) == ConversationHandler.END
+    unchanged = storage.get_subscription(saved.id, saved.target)
+    assert unchanged is not None
+    assert unchanged.digest_path == saved.digest_path
+    assert "setup" not in context.chat_data
+    assert "workflow" not in context.chat_data
+
+
+async def test_texts_save_rechecks_authorization(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    update = make_update()
+    context = make_context(storage, str(saved.id))
+    assert await texts_start(update, context) == TEXT_MENU
+    context.chat_data["texts"]["draft"] = [
+        {
+            "id": -1,
+            "kind": "intro",
+            "today_text": "Сегодня",
+            "yesterday_text": "Вчера",
+            "weight": 1,
+        }
+    ]
+    context.application.bot_data["settings"] = replace(
+        context.application.bot_data["settings"], admin_user_ids=frozenset({99})
+    )
+    update.effective_message.text = "Сохранить"
+
+    assert await text_menu_step(update, context) == ConversationHandler.END
+    assert storage.list_message_variants(saved.id, target=saved.target) == []
+
+
+async def test_texts_reentry_keeps_existing_draft(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    first = saved_subscription(storage)
+    second = saved_subscription(storage)
+    assert first.id is not None and second.id is not None
+    update = make_update()
+    context = make_context(storage, str(first.id))
+
+    assert await texts_start(update, context) == TEXT_MENU
+    context.chat_data["texts"]["draft"].append(
+        {
+            "id": -1,
+            "kind": "intro",
+            "today_text": "Черновик",
+            "yesterday_text": "Черновик",
+            "weight": 1,
+        }
+    )
+    context.args = [str(second.id)]
+
+    assert await texts_start(update, context) == TEXT_MENU
+    assert context.chat_data["texts"]["subscription_id"] == first.id
+    assert context.chat_data["texts"]["draft"][0]["today_text"] == "Черновик"
+
+
+async def test_other_admin_cannot_overwrite_or_cancel_texts_draft(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    owner_update = make_update()
+    context = make_context(storage, str(saved.id))
+    context.application.bot_data["settings"] = replace(
+        context.application.bot_data["settings"], admin_user_ids=frozenset({42, 43})
+    )
+    assert await texts_start(owner_update, context) == TEXT_MENU
+    original_draft = context.chat_data["texts"]
+
+    other_update = make_update()
+    other_update.effective_user.id = 43
+    assert await texts_start(other_update, context) == ConversationHandler.END
+    assert context.chat_data["texts"] is original_draft
+    assert await cancel(other_update, context) == ConversationHandler.END
+    assert context.chat_data["texts"] is original_draft
+
+
+async def test_other_admin_can_take_over_expired_workflow(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    saved = saved_subscription(storage)
+    assert saved.id is not None
+    owner_update = make_update()
+    context = make_context(storage, str(saved.id))
+    context.application.bot_data["settings"] = replace(
+        context.application.bot_data["settings"], admin_user_ids=frozenset({42, 43})
+    )
+    assert await texts_start(owner_update, context) == TEXT_MENU
+    context.chat_data["texts"]["draft"].append(
+        {
+            "id": -1,
+            "kind": "intro",
+            "today_text": "Брошенный черновик",
+            "yesterday_text": "Брошенный черновик",
+            "weight": 1,
+        }
+    )
+    context.chat_data["workflow"]["touched_at"] -= 31 * 60
+
+    other_update = make_update()
+    other_update.effective_user.id = 43
+    assert await texts_start(other_update, context) == TEXT_MENU
+    assert context.chat_data["workflow"]["owner_user_id"] == 43
+    assert context.chat_data["texts"]["draft"] == []
 
 
 async def test_pause_requires_configured_admin_access(tmp_path) -> None:

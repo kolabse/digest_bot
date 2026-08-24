@@ -18,6 +18,7 @@ from digest_bot.digest import (
     render_message,
     split_message,
 )
+from digest_bot.models import MessageVariant
 
 MARKDOWN = """# Дайджест проекта
 
@@ -187,3 +188,44 @@ def test_render_message_wraps_intro_and_outro(monkeypatch) -> None:
     assert "сегодня" in message.lower()
     assert "<i>Дайджест за 20.08.2026</i>" in message
     assert message.endswith("<i>Работа продолжается.</i>")
+
+
+def test_custom_variants_are_stable_and_escaped() -> None:
+    variants = (
+        MessageVariant(1, 7, "intro", "<Новости сегодня>", "<Новости вчера>", 1),
+        MessageVariant(2, 7, "outro_small", "Итог сегодня &", "Итог вчера &", 1),
+    )
+    document = extract_digest(MARKDOWN, date(2026, 8, 20))
+
+    first = render_message(
+        document,
+        digest_is_today=True,
+        selection_key="7:2026-08-20",
+        custom_variants=variants,
+    )
+    second = render_message(
+        document,
+        digest_is_today=True,
+        selection_key="7:2026-08-20",
+        custom_variants=variants,
+    )
+
+    assert first == second
+    assert "&lt;Новости сегодня&gt;" in first
+    assert "Итог сегодня &amp;" in first
+
+
+def test_custom_fallback_replaces_defaults_without_outro() -> None:
+    variants = (
+        MessageVariant(1, 7, "fallback", "Сегодня тихо", "Вчера было тихо", 100),
+    )
+
+    message = render_message(
+        extract_digest(MARKDOWN, date(2026, 8, 18)),
+        digest_is_today=False,
+        selection_key="7:2026-08-18",
+        custom_variants=variants,
+    )
+
+    assert "Вчера было тихо" in message
+    assert message.count("<i>") == 1

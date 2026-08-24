@@ -206,9 +206,14 @@ class DeliveryService:
                     subscription.token_env,
                 )
                 document = extract_digest(markdown, due.digest_date)
+                custom_variants = tuple(
+                    self._storage.list_message_variants(subscription.id) or ()
+                )
                 message = render_message(
                     document,
                     digest_is_today=due.digest_date == due.local_now.date(),
+                    selection_key=f"{subscription.id}:{digest_date}",
+                    custom_variants=custom_variants,
                 )
                 channel = self._channels[subscription.channel]
                 await channel.send(subscription.target, message)
@@ -326,4 +331,8 @@ class DeliveryService:
         return render_message(
             extract_digest(markdown, digest_date),
             digest_is_today=digest_date == local.date(),
+            selection_key=f"{subscription.id}:{digest_date.isoformat()}",
+            custom_variants=tuple(
+                self._storage.list_message_variants(subscription.id or 0) or ()
+            ),
         )

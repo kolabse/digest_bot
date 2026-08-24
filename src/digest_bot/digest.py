@@ -3,10 +3,11 @@ from __future__ import annotations
 import random
 import re
 from datetime import date
+from hashlib import sha256
 from html import escape
 from urllib.parse import urlparse
 
-from .models import DigestDocument
+from .models import DigestDocument, MessageVariant
 
 DATE_HEADING = re.compile(r"(?m)^## \[(\d{4}-\d{2}-\d{2})\]\s*$")
 BULLET = re.compile(r"(?m)^-\s+\S")
@@ -26,7 +27,6 @@ def extract_digest(markdown: str, target_date: date) -> DigestDocument:
     return DigestDocument(date=wanted, body=None)
 
 
-# TODO: make templates configurable.
 DEFAULT_EMPTY_INTRO = "Ежедневный дайджест проекта:"
 PRIMARY_EMPTY_VARIANTS = (
     (
@@ -267,28 +267,102 @@ def _choose_relative_variant(
     weights: tuple[int, ...],
     *,
     digest_is_today: bool,
+    selection_key: str | None = None,
 ) -> str:
-    selected = random.choices(variants, weights=weights, k=1)[0]
+    if selection_key is None:
+        selected = random.choices(variants, weights=weights, k=1)[0]
+    else:
+        bucket = int.from_bytes(sha256(selection_key.encode()).digest()[:8], "big") % sum(
+            weights
+        )
+        selected = variants[-1]
+        for variant, weight in zip(variants, weights, strict=True):
+            if bucket < weight:
+                selected = variant
+                break
+            bucket -= weight
     return selected[0 if digest_is_today else 1]
 
 
-def choose_empty_variant(*, digest_is_today: bool) -> str:
+def _variant_data(
+    custom_variants: tuple[MessageVariant, ...],
+    defaults: tuple[tuple[str, str], ...],
+    default_weights: tuple[int, ...],
+) -> tuple[tuple[tuple[str, str], ...], tuple[int, ...]]:
+    if not custom_variants:
+        return defaults, default_weights
+    return (
+        tuple((item.today_text, item.yesterday_text) for item in custom_variants),
+        tuple(item.weight for item in custom_variants),
+    )
+
+
+def _select_relative_variant(
+    variants: tuple[tuple[str, str], ...],
+    weights: tuple[int, ...],
+    *,
+    digest_is_today: bool,
+    selection_key: str | None,
+) -> str:
+    if selection_key is None:
+        return _choose_relative_variant(
+            variants,
+            weights,
+            digest_is_today=digest_is_today,
+        )
     return _choose_relative_variant(
+        variants,
+        weights,
+        digest_is_today=digest_is_today,
+        selection_key=selection_key,
+    )
+
+
+def choose_empty_variant(
+    *,
+    digest_is_today: bool,
+    custom_variants: tuple[MessageVariant, ...] = (),
+    selection_key: str | None = None,
+) -> str:
+    variants, weights = _variant_data(
+        custom_variants,
         EMPTY_VARIANTS,
         EMPTY_VARIANT_WEIGHTS,
+    )
+    return _select_relative_variant(
+        variants,
+        weights,
         digest_is_today=digest_is_today,
+        selection_key=selection_key,
     )
 
 
-def choose_intro_variant(*, digest_is_today: bool) -> str:
-    return _choose_relative_variant(
+def choose_intro_variant(
+    *,
+    digest_is_today: bool,
+    custom_variants: tuple[MessageVariant, ...] = (),
+    selection_key: str | None = None,
+) -> str:
+    variants, weights = _variant_data(
+        custom_variants,
         INTRO_VARIANTS,
         INTRO_VARIANT_WEIGHTS,
+    )
+    return _select_relative_variant(
+        variants,
+        weights,
         digest_is_today=digest_is_today,
+        selection_key=selection_key,
     )
 
 
-def choose_outro_variant(*, item_count: int, digest_is_today: bool) -> str:
+def choose_outro_variant(
+    *,
+    item_count: int,
+    digest_is_today: bool,
+    custom_variants: tuple[MessageVariant, ...] = (),
+    selection_key: str | None = None,
+) -> str:
     if item_count <= SMALL_DIGEST_MAX_ITEMS:
         primary = PRIMARY_SMALL_OUTRO_VARIANTS
         rare = RARE_SMALL_OUTRO_VARIANTS
@@ -300,10 +374,12 @@ def choose_outro_variant(*, item_count: int, digest_is_today: bool) -> str:
         rare = RARE_REGULAR_OUTRO_VARIANTS
     variants = primary + rare
     weights = (5,) * len(primary) + (1,) * len(rare)
-    return _choose_relative_variant(
+    variants, weights = _variant_data(custom_variants, variants, weights)
+    return _select_relative_variant(
         variants,
         weights,
         digest_is_today=digest_is_today,
+        selection_key=selection_key,
     )
 
 
@@ -397,17 +473,59 @@ def render_markdown_for_telegram(markdown: str) -> str:
     return "\n".join(rendered).strip()
 
 
-def render_message(document: DigestDocument, *, digest_is_today: bool) -> str:
+def render_message(
+    document: DigestDocument,
+    *,
+    digest_is_today: bool,
+    selection_key: str | None = None,
+    custom_variants: tuple[MessageVariant, ...] = (),
+) -> str:
     display_date = date.fromisoformat(document.date).strftime("%d.%m.%Y")
+    variants_by_kind = {
+        kind: tuple(item for item in custom_variants if item.kind == kind)
+        for kind in {item.kind for item in custom_variants}
+    }
     if document.body:
         body = document.body
-        intro = choose_intro_variant(digest_is_today=digest_is_today)
-        outro = choose_outro_variant(
-            item_count=len(BULLET.findall(body)),
-            digest_is_today=digest_is_today,
-        )
+        intro_variants = variants_by_kind.get("intro", ())
+        if selection_key is None and not intro_variants:
+            intro = choose_intro_variant(digest_is_today=digest_is_today)
+        else:
+            intro = choose_intro_variant(
+                digest_is_today=digest_is_today,
+                custom_variants=intro_variants,
+                selection_key=f"{selection_key}:intro" if selection_key else None,
+            )
+        item_count = len(BULLET.findall(body))
+        if item_count <= SMALL_DIGEST_MAX_ITEMS:
+            outro_kind = "outro_small"
+        elif item_count >= LARGE_DIGEST_MIN_ITEMS:
+            outro_kind = "outro_large"
+        else:
+            outro_kind = "outro_regular"
+        outro_variants = variants_by_kind.get(outro_kind, ())
+        if selection_key is None and not outro_variants:
+            outro = choose_outro_variant(
+                item_count=item_count,
+                digest_is_today=digest_is_today,
+            )
+        else:
+            outro = choose_outro_variant(
+                item_count=item_count,
+                digest_is_today=digest_is_today,
+                custom_variants=outro_variants,
+                selection_key=f"{selection_key}:{outro_kind}" if selection_key else None,
+            )
     else:
-        body = choose_empty_variant(digest_is_today=digest_is_today)
+        fallback_variants = variants_by_kind.get("fallback", ())
+        if selection_key is None and not fallback_variants:
+            body = choose_empty_variant(digest_is_today=digest_is_today)
+        else:
+            body = choose_empty_variant(
+                digest_is_today=digest_is_today,
+                custom_variants=fallback_variants,
+                selection_key=f"{selection_key}:fallback" if selection_key else None,
+            )
         intro = DEFAULT_EMPTY_INTRO
         outro = None
     rendered_intro = escape(intro)
