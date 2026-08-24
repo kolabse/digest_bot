@@ -20,6 +20,11 @@ class Subscription:
     send_time: str
     created_by: int
     active: bool = True
+    control_target: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.control_target is None:
+            object.__setattr__(self, "control_target", self.target)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,3 +88,12 @@ class MessageVariant:
     today_text: str
     yesterday_text: str
     weight: int
+
+
+@dataclass(frozen=True, slots=True)
+class EmailRecipientGroup:
+    id: int
+    control_target: str
+    created_by: int
+    name: str
+    recipients: tuple[str, ...]

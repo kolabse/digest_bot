@@ -146,6 +146,82 @@ CREATE INDEX message_variants_subscription_kind_idx
 ON message_variants (subscription_id, kind, id)
 """
 
+SUBSCRIPTIONS_SCHEMA_V5 = """
+CREATE TABLE subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,
+    target TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    digest_path TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    token_env TEXT,
+    timezone TEXT NOT NULL,
+    send_time TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+, control_target TEXT NOT NULL DEFAULT '')
+"""
+
+SUBSCRIPTIONS_CONTROL_TARGET_INDEX = """
+CREATE INDEX subscriptions_control_target_idx
+ON subscriptions (control_target, id)
+"""
+
+EMAIL_RECIPIENT_GROUPS_SCHEMA = """
+CREATE TABLE email_recipient_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    control_target TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 64),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (control_target, name COLLATE NOCASE)
+)
+"""
+
+EMAIL_RECIPIENT_GROUPS_INDEX = """
+CREATE INDEX email_recipient_groups_scope_idx
+ON email_recipient_groups (control_target, id)
+"""
+
+EMAIL_RECIPIENT_GROUP_MEMBERS_SCHEMA = """
+CREATE TABLE email_recipient_group_members (
+    group_id INTEGER NOT NULL REFERENCES email_recipient_groups(id) ON DELETE CASCADE,
+    email TEXT NOT NULL CHECK (length(email) BETWEEN 3 AND 254),
+    PRIMARY KEY (group_id, email)
+)
+"""
+
+EMAIL_DELIVERY_BATCHES_SCHEMA = """
+CREATE TABLE email_delivery_batches (
+    batch_key TEXT PRIMARY KEY CHECK (length(batch_key) = 64),
+    target TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+EMAIL_DELIVERY_RECIPIENTS_SCHEMA = """
+CREATE TABLE email_delivery_recipients (
+    batch_key TEXT NOT NULL REFERENCES email_delivery_batches(batch_key) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sending', 'sent', 'failed')),
+    claim_token TEXT,
+    lease_expires_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (batch_key, email),
+    CHECK (
+        (status = 'sending' AND claim_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (status != 'sending' AND claim_token IS NULL AND lease_expires_at IS NULL)
+    )
+)
+"""
+
+EMAIL_DELIVERY_RECIPIENTS_STATUS_INDEX = """
+CREATE INDEX email_delivery_recipients_status_idx
+ON email_delivery_recipients (batch_key, status, email)
+"""
+
+
 def _normalize_schema_sql(value: str) -> str:
     return " ".join(value.split()).casefold()
 
@@ -158,19 +234,13 @@ _EXPECTED_SCHEMAS = {
     2: {
         ("table", "subscriptions"): _normalize_schema_sql(SUBSCRIPTIONS_SCHEMA),
         ("table", "deliveries"): _normalize_schema_sql(DELIVERIES_SCHEMA),
-        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(
-            DELIVERIES_RETRY_INDEX
-        ),
+        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(DELIVERIES_RETRY_INDEX),
     },
     3: {
         ("table", "subscriptions"): _normalize_schema_sql(SUBSCRIPTIONS_SCHEMA),
         ("table", "deliveries"): _normalize_schema_sql(DELIVERIES_SCHEMA),
-        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(
-            DELIVERIES_RETRY_INDEX
-        ),
-        ("index", "deliveries_retention_idx"): _normalize_schema_sql(
-            DELIVERIES_RETENTION_INDEX
-        ),
+        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(DELIVERIES_RETRY_INDEX),
+        ("index", "deliveries_retention_idx"): _normalize_schema_sql(DELIVERIES_RETENTION_INDEX),
         ("table", "delivery_failure_notifications"): _normalize_schema_sql(
             FAILURE_NOTIFICATIONS_SCHEMA
         ),
@@ -181,23 +251,50 @@ _EXPECTED_SCHEMAS = {
     4: {
         ("table", "subscriptions"): _normalize_schema_sql(SUBSCRIPTIONS_SCHEMA),
         ("table", "deliveries"): _normalize_schema_sql(DELIVERIES_SCHEMA),
-        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(
-            DELIVERIES_RETRY_INDEX
-        ),
-        ("index", "deliveries_retention_idx"): _normalize_schema_sql(
-            DELIVERIES_RETENTION_INDEX
-        ),
+        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(DELIVERIES_RETRY_INDEX),
+        ("index", "deliveries_retention_idx"): _normalize_schema_sql(DELIVERIES_RETENTION_INDEX),
         ("table", "delivery_failure_notifications"): _normalize_schema_sql(
             FAILURE_NOTIFICATIONS_SCHEMA
         ),
         ("index", "delivery_failure_notifications_due_idx"): _normalize_schema_sql(
             FAILURE_NOTIFICATIONS_DUE_INDEX
         ),
-        ("table", "message_variants"): _normalize_schema_sql(
-            MESSAGE_VARIANTS_SCHEMA
-        ),
+        ("table", "message_variants"): _normalize_schema_sql(MESSAGE_VARIANTS_SCHEMA),
         ("index", "message_variants_subscription_kind_idx"): _normalize_schema_sql(
             MESSAGE_VARIANTS_INDEX
+        ),
+    },
+    5: {
+        ("table", "subscriptions"): _normalize_schema_sql(SUBSCRIPTIONS_SCHEMA_V5),
+        ("index", "subscriptions_control_target_idx"): _normalize_schema_sql(
+            SUBSCRIPTIONS_CONTROL_TARGET_INDEX
+        ),
+        ("table", "deliveries"): _normalize_schema_sql(DELIVERIES_SCHEMA),
+        ("index", "deliveries_retry_due_idx"): _normalize_schema_sql(DELIVERIES_RETRY_INDEX),
+        ("index", "deliveries_retention_idx"): _normalize_schema_sql(DELIVERIES_RETENTION_INDEX),
+        ("table", "delivery_failure_notifications"): _normalize_schema_sql(
+            FAILURE_NOTIFICATIONS_SCHEMA
+        ),
+        ("index", "delivery_failure_notifications_due_idx"): _normalize_schema_sql(
+            FAILURE_NOTIFICATIONS_DUE_INDEX
+        ),
+        ("table", "message_variants"): _normalize_schema_sql(MESSAGE_VARIANTS_SCHEMA),
+        ("index", "message_variants_subscription_kind_idx"): _normalize_schema_sql(
+            MESSAGE_VARIANTS_INDEX
+        ),
+        ("table", "email_recipient_groups"): _normalize_schema_sql(EMAIL_RECIPIENT_GROUPS_SCHEMA),
+        ("index", "email_recipient_groups_scope_idx"): _normalize_schema_sql(
+            EMAIL_RECIPIENT_GROUPS_INDEX
+        ),
+        ("table", "email_recipient_group_members"): _normalize_schema_sql(
+            EMAIL_RECIPIENT_GROUP_MEMBERS_SCHEMA
+        ),
+        ("table", "email_delivery_batches"): _normalize_schema_sql(EMAIL_DELIVERY_BATCHES_SCHEMA),
+        ("table", "email_delivery_recipients"): _normalize_schema_sql(
+            EMAIL_DELIVERY_RECIPIENTS_SCHEMA
+        ),
+        ("index", "email_delivery_recipients_status_idx"): _normalize_schema_sql(
+            EMAIL_DELIVERY_RECIPIENTS_STATUS_INDEX
         ),
     },
 }
@@ -210,10 +307,7 @@ def _user_schema(connection: sqlite3.Connection) -> dict[tuple[str, str], str]:
         WHERE name NOT LIKE 'sqlite_%'
         """
     )
-    return {
-        (str(row[0]), str(row[1])): _normalize_schema_sql(str(row[2] or ""))
-        for row in rows
-    }
+    return {(str(row[0]), str(row[1])): _normalize_schema_sql(str(row[2] or "")) for row in rows}
 
 
 def _validate_schema(connection: sqlite3.Connection, version: int, label: str) -> None:
@@ -288,11 +382,27 @@ def _migrate_to_version_4(connection: sqlite3.Connection) -> None:
     connection.execute(MESSAGE_VARIANTS_INDEX)
 
 
+def _migrate_to_version_5(connection: sqlite3.Connection) -> None:
+    _validate_schema(connection, 4, "version 4")
+    connection.execute(
+        "ALTER TABLE subscriptions ADD COLUMN control_target TEXT NOT NULL DEFAULT ''"
+    )
+    connection.execute("UPDATE subscriptions SET control_target = target")
+    connection.execute(SUBSCRIPTIONS_CONTROL_TARGET_INDEX)
+    connection.execute(EMAIL_RECIPIENT_GROUPS_SCHEMA)
+    connection.execute(EMAIL_RECIPIENT_GROUPS_INDEX)
+    connection.execute(EMAIL_RECIPIENT_GROUP_MEMBERS_SCHEMA)
+    connection.execute(EMAIL_DELIVERY_BATCHES_SCHEMA)
+    connection.execute(EMAIL_DELIVERY_RECIPIENTS_SCHEMA)
+    connection.execute(EMAIL_DELIVERY_RECIPIENTS_STATUS_INDEX)
+
+
 MIGRATIONS: dict[int, Migration] = {
     1: _migrate_to_version_1,
     2: _migrate_to_version_2,
     3: _migrate_to_version_3,
     4: _migrate_to_version_4,
+    5: _migrate_to_version_5,
 }
 LATEST_SCHEMA_VERSION = max(MIGRATIONS)
 

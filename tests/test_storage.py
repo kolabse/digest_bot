@@ -96,9 +96,7 @@ def test_initialization_versions_legacy_database_without_losing_data(tmp_path) -
         )
     ]
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
-            LATEST_SCHEMA_VERSION
-        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (LATEST_SCHEMA_VERSION)
         assert connection.execute(
             """
             SELECT status, error, attempt_count, next_attempt_at, claim_token
@@ -201,21 +199,239 @@ def test_initialization_creates_current_schema_and_is_idempotent(tmp_path) -> No
 
     assert storage.list_subscriptions() == [saved]
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
-            LATEST_SCHEMA_VERSION
-        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (LATEST_SCHEMA_VERSION)
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_schema WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")
         }
         assert {
             "subscriptions",
             "deliveries",
             "delivery_failure_notifications",
             "message_variants",
+            "email_recipient_groups",
+            "email_recipient_group_members",
+            "email_delivery_batches",
+            "email_delivery_recipients",
         } <= tables
+
+
+def test_version_4_migration_backfills_subscription_control_target(tmp_path) -> None:
+    database_path = tmp_path / "bot.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        for version in range(1, 5):
+            migrations_module.MIGRATIONS[version](connection)
+            connection.execute(f"PRAGMA user_version = {version}")
+        connection.execute(
+            """
+            INSERT INTO subscriptions (
+                channel, target, repository, digest_path, ref, token_env,
+                timezone, send_time, created_by, active
+            ) VALUES ('telegram', '123', 'owner/repo', 'docs/project-digest.md',
+                      'main', NULL, 'UTC', '09:00', 42, 1)
+            """
+        )
+
+    storage = Storage(database_path)
+    storage.initialize()
+
+    saved = storage.get_subscription(1, "123")
+    assert saved is not None
+    assert saved.target == "123"
+    assert saved.control_target == "123"
+
+
+def test_subscription_control_scope_is_separate_from_delivery_target(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    group = storage.add_email_recipient_group("123", 42, "Команда", ["team@example.com"])
+    email_subscription = replace(
+        subscription(),
+        channel="email",
+        target=storage.email_group_target(group.id),
+        control_target="123",
+    )
+
+    saved = storage.add_subscription(email_subscription)
+
+    assert saved.control_target == "123"
+    assert storage.get_subscription(saved.id, "123") == saved
+    assert storage.get_subscription(saved.id, storage.email_group_target(group.id)) is None
+    assert storage.list_subscriptions(target="123") == [saved]
+
+
+def test_email_recipient_group_crud_is_normalized_and_chat_scoped(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+
+    group = storage.add_email_recipient_group(
+        "123",
+        42,
+        "  Команда проекта  ",
+        ["Mike@Example.com", "team@example.com", "mike@example.com"],
+    )
+
+    assert group.name == "Команда проекта"
+    assert group.recipients == ("mike@example.com", "team@example.com")
+    assert storage.list_email_recipient_groups("123") == [group]
+    assert storage.list_email_recipient_groups("999") == []
+    assert storage.get_email_recipient_group(group.id, "999") is None
+
+    updated = storage.update_email_recipient_group(
+        group.id,
+        "123",
+        "Редакторы",
+        ["editors@example.com"],
+    )
+    assert updated is not None
+    assert updated.name == "Редакторы"
+    assert updated.recipients == ("editors@example.com",)
+    assert storage.delete_email_recipient_group(group.id, "999") is False
+    assert storage.delete_email_recipient_group(group.id, "123") is True
+
+
+def test_email_group_cannot_be_deleted_while_subscription_uses_it(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    group = storage.add_email_recipient_group("123", 42, "Команда", ["team@example.com"])
+    storage.add_subscription(
+        replace(
+            subscription(),
+            channel="email",
+            target=storage.email_group_target(group.id),
+            control_target="123",
+        )
+    )
+
+    with pytest.raises(ValueError, match="used by a subscription"):
+        storage.delete_email_recipient_group(group.id, "123")
+
+
+def test_email_subscription_rejects_group_from_another_control_chat(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    foreign_group = storage.add_email_recipient_group(
+        "999", 42, "Чужая группа", ["foreign@example.com"]
+    )
+
+    with pytest.raises(ValueError, match="current control target"):
+        storage.add_subscription(
+            replace(
+                subscription(),
+                channel="email",
+                target=storage.email_group_target(foreign_group.id),
+                control_target="123",
+            )
+        )
+
+
+def test_email_subscription_update_is_scoped_by_control_target(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    group = storage.add_email_recipient_group("123", 42, "Команда", ["team@example.com"])
+    saved = storage.add_subscription(
+        replace(
+            subscription(),
+            channel="email",
+            target=storage.email_group_target(group.id),
+            control_target="123",
+        )
+    )
+
+    updated = storage.update_subscription(replace(saved, digest_path="docs/email-digest.md"))
+
+    assert updated is not None
+    assert updated.digest_path == "docs/email-digest.md"
+
+
+def test_email_delivery_failure_notifies_controlling_telegram_chat(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    group = storage.add_email_recipient_group("123", 42, "Команда", ["team@example.com"])
+    saved = storage.add_subscription(
+        replace(
+            subscription(),
+            channel="email",
+            target=storage.email_group_target(group.id),
+            control_target="123",
+        )
+    )
+    assert saved.id is not None
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    claim = storage.claim_delivery(saved.id, "2026-08-19", now)
+    assert claim is not None
+    assert storage.fail_delivery(
+        claim,
+        now,
+        "PermanentDeliveryError",
+        next_attempt_at=None,
+        reason="permanent_error",
+    )
+
+    notification = storage.claim_failure_notification(
+        now,
+        max_attempts=3,
+        stale_after=timedelta(minutes=10),
+    )
+
+    assert notification is not None
+    assert notification.channel == "telegram"
+    assert notification.target == "123"
+
+
+def test_email_recipient_claim_prevents_concurrent_delivery(tmp_path) -> None:
+    storage = Storage(tmp_path / "bot.sqlite3")
+    storage.initialize()
+    recipients = ("first@example.com", "second@example.com")
+    now = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    batch_key = "a" * 64
+
+    first_token, first_claim, _, first_in_flight = storage.claim_email_delivery_batch(
+        batch_key, "email-group:1", recipients, now
+    )
+    second_token, second_claim, _, second_in_flight = storage.claim_email_delivery_batch(
+        batch_key, "email-group:1", recipients, now
+    )
+
+    assert first_token != second_token
+    assert first_claim == recipients
+    assert first_in_flight is False
+    assert second_claim == ()
+    assert second_in_flight is True
+
+    assert storage.renew_email_delivery_claim(
+        batch_key,
+        first_token,
+        now + timedelta(minutes=9),
+        stale_after=timedelta(minutes=10),
+    )
+    _, renewed_claim, _, renewed_in_flight = storage.claim_email_delivery_batch(
+        batch_key,
+        "email-group:1",
+        recipients,
+        now + timedelta(minutes=11),
+    )
+    assert renewed_claim == ()
+    assert renewed_in_flight is True
+
+    assert storage.finish_email_delivery_recipient(
+        batch_key,
+        "first@example.com",
+        first_token,
+        outcome="sent",
+    )
+    assert storage.finish_email_delivery_recipient(
+        batch_key,
+        "second@example.com",
+        first_token,
+        outcome="pending",
+    )
+
+    _, retry_claim, _, retry_in_flight = storage.claim_email_delivery_batch(
+        batch_key, "email-group:1", recipients, now
+    )
+    assert retry_claim == ("second@example.com",)
+    assert retry_in_flight is False
 
 
 def test_message_variant_crud_is_scoped_to_subscription_chat(tmp_path) -> None:
@@ -310,14 +526,17 @@ def test_message_variant_validation_and_limit(tmp_path) -> None:
     with pytest.raises(ValueError, match="between 1 and 100"):
         storage.add_message_variant(saved.id, "123", "intro", "today", "yesterday", 0)
     for index in range(20):
-        assert storage.add_message_variant(
-            saved.id,
-            "123",
-            "intro",
-            f"today {index}",
-            f"yesterday {index}",
-            1,
-        ) is not None
+        assert (
+            storage.add_message_variant(
+                saved.id,
+                "123",
+                "intro",
+                f"today {index}",
+                f"yesterday {index}",
+                1,
+            )
+            is not None
+        )
     with pytest.raises(ValueError, match="at most 20"):
         storage.add_message_variant(
             saved.id,
@@ -364,12 +583,11 @@ def test_version_2_migration_preserves_deliveries_and_adds_empty_outbox(tmp_path
     assert record is not None
     assert record.status == "sent"
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == (
-            LATEST_SCHEMA_VERSION
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == (LATEST_SCHEMA_VERSION)
+        assert (
+            connection.execute("SELECT COUNT(*) FROM delivery_failure_notifications").fetchone()[0]
+            == 0
         )
-        assert connection.execute(
-            "SELECT COUNT(*) FROM delivery_failure_notifications"
-        ).fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM message_variants").fetchone()[0] == 0
 
 
@@ -377,7 +595,7 @@ def test_delivery_stats_are_scoped_and_include_latest_record(tmp_path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     storage.initialize()
     first = storage.add_subscription(subscription())
-    second = storage.add_subscription(replace(subscription(), target="999"))
+    second = storage.add_subscription(replace(subscription(), target="999", control_target="999"))
     assert first.id is not None
     assert second.id is not None
     now = datetime(2026, 8, 20, 9, tzinfo=UTC)
@@ -465,11 +683,14 @@ def test_failure_notification_retry_survives_restart(tmp_path) -> None:
 
     restarted = Storage(database_path)
     restarted.initialize()
-    assert restarted.claim_failure_notification(
-        retry_at - timedelta(seconds=1),
-        max_attempts=3,
-        stale_after=timedelta(minutes=10),
-    ) is None
+    assert (
+        restarted.claim_failure_notification(
+            retry_at - timedelta(seconds=1),
+            max_attempts=3,
+            stale_after=timedelta(minutes=10),
+        )
+        is None
+    )
     second = restarted.claim_failure_notification(
         retry_at,
         max_attempts=3,
@@ -539,11 +760,14 @@ def test_exhausted_stale_notification_is_reported_as_abandoned(tmp_path) -> None
     )
 
     assert abandoned == [(saved.id, "2026-08-19", "telegram")]
-    assert storage.claim_failure_notification(
-        now + timedelta(minutes=1),
-        max_attempts=1,
-        stale_after=timedelta(minutes=1),
-    ) is None
+    assert (
+        storage.claim_failure_notification(
+            now + timedelta(minutes=1),
+            max_attempts=1,
+            stale_after=timedelta(minutes=1),
+        )
+        is None
+    )
     assert not storage.complete_failure_notification(
         notification,
         now + timedelta(minutes=1),
@@ -594,9 +818,7 @@ def test_initialization_rejects_newer_schema_version(tmp_path) -> None:
 
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == future_version
-        assert connection.execute("SELECT value FROM future_data").fetchone()[0] == (
-            "preserve me"
-        )
+        assert connection.execute("SELECT value FROM future_data").fetchone()[0] == ("preserve me")
 
 
 def test_failed_migration_is_rolled_back(tmp_path, monkeypatch) -> None:
@@ -615,9 +837,12 @@ def test_failed_migration_is_rolled_back(tmp_path, monkeypatch) -> None:
 
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT name FROM sqlite_schema WHERE name = 'partial_change'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_schema WHERE name = 'partial_change'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_storage_crud_and_delivery_claim(tmp_path) -> None:
@@ -720,9 +945,7 @@ def test_initialization_rejects_unknown_legacy_delivery_status(tmp_path) -> None
 
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert connection.execute("SELECT status FROM deliveries").fetchone()[0] == (
-            "unknown"
-        )
+        assert connection.execute("SELECT status FROM deliveries").fetchone()[0] == ("unknown")
 
 
 def test_failed_delivery_waits_for_backoff_and_becomes_terminal(tmp_path) -> None:
@@ -741,12 +964,15 @@ def test_failed_delivery_waits_for_backoff_and_becomes_terminal(tmp_path) -> Non
         "temporary error",
         next_attempt_at=retry_at,
     )
-    assert storage.claim_delivery(
-        saved.id,
-        "2026-08-19",
-        retry_at - timedelta(seconds=1),
-        max_attempts=2,
-    ) is None
+    assert (
+        storage.claim_delivery(
+            saved.id,
+            "2026-08-19",
+            retry_at - timedelta(seconds=1),
+            max_attempts=2,
+        )
+        is None
+    )
     second_claim = storage.claim_delivery(
         saved.id,
         "2026-08-19",
@@ -768,12 +994,15 @@ def test_failed_delivery_waits_for_backoff_and_becomes_terminal(tmp_path) -> Non
     assert record.attempt_count == 2
     assert record.error == "still failing"
     assert record.failed_at == retry_at.isoformat()
-    assert storage.claim_delivery(
-        saved.id,
-        "2026-08-19",
-        retry_at + timedelta(hours=1),
-        max_attempts=2,
-    ) is None
+    assert (
+        storage.claim_delivery(
+            saved.id,
+            "2026-08-19",
+            retry_at + timedelta(hours=1),
+            max_attempts=2,
+        )
+        is None
+    )
 
 
 def test_open_delivery_expires_after_delivery_window(tmp_path) -> None:

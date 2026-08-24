@@ -7,6 +7,8 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from email.errors import HeaderParseError
+from email.headerregistry import Address
 from pathlib import Path
 
 from .migrations import migrate
@@ -15,6 +17,7 @@ from .models import (
     DeliveryClaim,
     DeliveryRecord,
     DeliveryStats,
+    EmailRecipientGroup,
     FailureNotificationClaim,
     MessageVariant,
     Subscription,
@@ -64,16 +67,28 @@ class Storage:
             send_time=row["send_time"],
             created_by=row["created_by"],
             active=bool(row["active"]),
+            control_target=row["control_target"],
         )
 
     def add_subscription(self, subscription: Subscription) -> Subscription:
         with self._connect() as connection:
+            if subscription.channel == "email":
+                group_id = self._email_group_id_from_target(subscription.target)
+                group = connection.execute(
+                    """
+                    SELECT 1 FROM email_recipient_groups
+                    WHERE id = ? AND control_target = ?
+                    """,
+                    (group_id, subscription.control_target),
+                ).fetchone()
+                if group is None:
+                    raise ValueError("Email group does not belong to the current control target")
             cursor = connection.execute(
                 """
                 INSERT INTO subscriptions (
                     channel, target, repository, digest_path, ref, token_env,
-                    timezone, send_time, created_by, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timezone, send_time, created_by, active, control_target
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     subscription.channel,
@@ -86,6 +101,7 @@ class Storage:
                     subscription.send_time,
                     subscription.created_by,
                     int(subscription.active),
+                    subscription.control_target,
                 ),
             )
             subscription_id = int(cursor.lastrowid or 0)
@@ -101,13 +117,14 @@ class Storage:
             send_time=subscription.send_time,
             created_by=subscription.created_by,
             active=subscription.active,
+            control_target=subscription.control_target,
         )
 
     def list_subscriptions(self, *, target: str | None = None) -> list[Subscription]:
         query = "SELECT * FROM subscriptions"
         params: tuple[str, ...] = ()
         if target is not None:
-            query += " WHERE target = ?"
+            query += " WHERE control_target = ?"
             params = (target,)
         query += " ORDER BY id"
         with self._connect() as connection:
@@ -116,7 +133,7 @@ class Storage:
     def get_subscription(self, subscription_id: int, target: str) -> Subscription | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM subscriptions WHERE id = ? AND target = ?",
+                "SELECT * FROM subscriptions WHERE id = ? AND control_target = ?",
                 (subscription_id, target),
             ).fetchone()
             return self._from_row(row) if row is not None else None
@@ -130,7 +147,7 @@ class Storage:
                 UPDATE subscriptions SET
                     repository = ?, digest_path = ?, ref = ?, token_env = ?,
                     timezone = ?, send_time = ?
-                WHERE id = ? AND target = ?
+                WHERE id = ? AND control_target = ?
                 """,
                 (
                     subscription.repository,
@@ -140,14 +157,14 @@ class Storage:
                     subscription.timezone,
                     subscription.send_time,
                     subscription.id,
-                    subscription.target,
+                    subscription.control_target,
                 ),
             )
             if cursor.rowcount == 0:
                 return None
             row = connection.execute(
-                "SELECT * FROM subscriptions WHERE id = ? AND target = ?",
-                (subscription.id, subscription.target),
+                "SELECT * FROM subscriptions WHERE id = ? AND control_target = ?",
+                (subscription.id, subscription.control_target),
             ).fetchone()
             return self._from_row(row)
 
@@ -161,12 +178,12 @@ class Storage:
             connection.execute(
                 """
                 UPDATE subscriptions SET active = ?
-                WHERE id = ? AND target = ?
+                WHERE id = ? AND control_target = ?
                 """,
                 (int(active), subscription_id, target),
             )
             row = connection.execute(
-                "SELECT * FROM subscriptions WHERE id = ? AND target = ?",
+                "SELECT * FROM subscriptions WHERE id = ? AND control_target = ?",
                 (subscription_id, target),
             ).fetchone()
             return self._from_row(row) if row is not None else None
@@ -174,8 +191,353 @@ class Storage:
     def delete_subscription(self, subscription_id: int, target: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
-                "DELETE FROM subscriptions WHERE id = ? AND target = ?",
+                "DELETE FROM subscriptions WHERE id = ? AND control_target = ?",
                 (subscription_id, target),
+            )
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _normalize_group_name(name: str) -> str:
+        normalized = " ".join(name.split())
+        if not 1 <= len(normalized) <= 64:
+            raise ValueError("Email group name must contain 1 to 64 characters")
+        return normalized
+
+    @staticmethod
+    def normalize_email_recipients(recipients: list[str]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in recipients:
+            value = raw.strip()
+            if not value:
+                continue
+            try:
+                address = Address(addr_spec=value)
+            except (HeaderParseError, ValueError) as exc:
+                raise ValueError(f"Invalid email address: {value}") from exc
+            canonical = address.addr_spec.casefold()
+            if len(canonical) > 254:
+                raise ValueError(f"Invalid email address: {value}")
+            if canonical not in seen:
+                seen.add(canonical)
+                normalized.append(canonical)
+        if not normalized:
+            raise ValueError("An email group must contain at least one recipient")
+        if len(normalized) > 100:
+            raise ValueError("An email group can contain at most 100 recipients")
+        return tuple(normalized)
+
+    @staticmethod
+    def _email_group_from_rows(
+        row: sqlite3.Row,
+        recipients: tuple[str, ...],
+    ) -> EmailRecipientGroup:
+        return EmailRecipientGroup(
+            id=int(row["id"]),
+            control_target=str(row["control_target"]),
+            created_by=int(row["created_by"]),
+            name=str(row["name"]),
+            recipients=recipients,
+        )
+
+    @staticmethod
+    def email_group_target(group_id: int) -> str:
+        if group_id <= 0:
+            raise ValueError("Email group ID must be positive")
+        return f"email-group:{group_id}"
+
+    @staticmethod
+    def _email_group_id_from_target(target: str) -> int:
+        prefix = "email-group:"
+        if not target.startswith(prefix) or not target[len(prefix) :].isdigit():
+            raise ValueError("Invalid email group target")
+        group_id = int(target[len(prefix) :])
+        if group_id <= 0:
+            raise ValueError("Invalid email group target")
+        return group_id
+
+    def add_email_recipient_group(
+        self,
+        control_target: str,
+        created_by: int,
+        name: str,
+        recipients: list[str],
+    ) -> EmailRecipientGroup:
+        name = self._normalize_group_name(name)
+        normalized = self.normalize_email_recipients(recipients)
+        with self._connect(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO email_recipient_groups (control_target, created_by, name)
+                VALUES (?, ?, ?)
+                """,
+                (control_target, created_by, name),
+            )
+            group_id = int(cursor.lastrowid or 0)
+            connection.executemany(
+                """
+                INSERT INTO email_recipient_group_members (group_id, email)
+                VALUES (?, ?)
+                """,
+                [(group_id, email) for email in normalized],
+            )
+            row = connection.execute(
+                "SELECT * FROM email_recipient_groups WHERE id = ?",
+                (group_id,),
+            ).fetchone()
+            return self._email_group_from_rows(row, normalized)
+
+    def list_email_recipient_groups(self, control_target: str) -> list[EmailRecipientGroup]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM email_recipient_groups
+                WHERE control_target = ? ORDER BY id
+                """,
+                (control_target,),
+            ).fetchall()
+            groups: list[EmailRecipientGroup] = []
+            for row in rows:
+                recipients = tuple(
+                    str(member[0])
+                    for member in connection.execute(
+                        """
+                        SELECT email FROM email_recipient_group_members
+                        WHERE group_id = ? ORDER BY email
+                        """,
+                        (row["id"],),
+                    )
+                )
+                groups.append(self._email_group_from_rows(row, recipients))
+            return groups
+
+    def get_email_recipient_group(
+        self,
+        group_id: int,
+        control_target: str,
+    ) -> EmailRecipientGroup | None:
+        return next(
+            (
+                group
+                for group in self.list_email_recipient_groups(control_target)
+                if group.id == group_id
+            ),
+            None,
+        )
+
+    def resolve_email_group_target(self, target: str) -> EmailRecipientGroup | None:
+        group_id = self._email_group_id_from_target(target)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM email_recipient_groups WHERE id = ?",
+                (group_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            recipients = tuple(
+                str(member[0])
+                for member in connection.execute(
+                    """
+                    SELECT email FROM email_recipient_group_members
+                    WHERE group_id = ? ORDER BY email
+                    """,
+                    (group_id,),
+                )
+            )
+            return self._email_group_from_rows(row, recipients)
+
+    def update_email_recipient_group(
+        self,
+        group_id: int,
+        control_target: str,
+        name: str,
+        recipients: list[str],
+    ) -> EmailRecipientGroup | None:
+        name = self._normalize_group_name(name)
+        normalized = self.normalize_email_recipients(recipients)
+        with self._connect(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE email_recipient_groups SET name = ?
+                WHERE id = ? AND control_target = ?
+                """,
+                (name, group_id, control_target),
+            )
+            if cursor.rowcount == 0:
+                return None
+            connection.execute(
+                "DELETE FROM email_recipient_group_members WHERE group_id = ?",
+                (group_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO email_recipient_group_members (group_id, email)
+                VALUES (?, ?)
+                """,
+                [(group_id, email) for email in normalized],
+            )
+            row = connection.execute(
+                "SELECT * FROM email_recipient_groups WHERE id = ?",
+                (group_id,),
+            ).fetchone()
+            return self._email_group_from_rows(row, normalized)
+
+    def delete_email_recipient_group(self, group_id: int, control_target: str) -> bool:
+        target = self.email_group_target(group_id)
+        with self._connect(immediate=True) as connection:
+            in_use = connection.execute(
+                """
+                SELECT 1 FROM subscriptions
+                WHERE channel = 'email' AND target = ? AND control_target = ?
+                """,
+                (target, control_target),
+            ).fetchone()
+            if in_use is not None:
+                raise ValueError("Email group is used by a subscription")
+            cursor = connection.execute(
+                """
+                DELETE FROM email_recipient_groups
+                WHERE id = ? AND control_target = ?
+                """,
+                (group_id, control_target),
+            )
+            return cursor.rowcount > 0
+
+    def claim_email_delivery_batch(
+        self,
+        batch_key: str,
+        target: str,
+        recipients: tuple[str, ...],
+        now: datetime,
+        *,
+        stale_after: timedelta = timedelta(minutes=10),
+    ) -> tuple[str, tuple[str, ...], bool, bool]:
+        if len(batch_key) != 64:
+            raise ValueError("Email delivery batch key must contain 64 characters")
+        claim_token = uuid.uuid4().hex
+        lease_expires_at = (now + stale_after).isoformat()
+        with self._connect(immediate=True) as connection:
+            connection.execute(
+                """
+                DELETE FROM email_delivery_batches
+                WHERE created_at < datetime('now', '-180 days')
+                """
+            )
+            cursor = connection.execute(
+                """
+                INSERT INTO email_delivery_batches (batch_key, target)
+                VALUES (?, ?)
+                ON CONFLICT (batch_key) DO NOTHING
+                """,
+                (batch_key, target),
+            )
+            if cursor.rowcount > 0:
+                connection.executemany(
+                    """
+                    INSERT INTO email_delivery_recipients (batch_key, email, status)
+                    VALUES (?, ?, 'pending')
+                    """,
+                    [(batch_key, email) for email in recipients],
+                )
+            else:
+                row = connection.execute(
+                    "SELECT target FROM email_delivery_batches WHERE batch_key = ?",
+                    (batch_key,),
+                ).fetchone()
+                if row is None or row["target"] != target:
+                    raise ValueError("Email delivery batch target mismatch")
+            connection.execute(
+                """
+                UPDATE email_delivery_recipients
+                SET status = 'pending', claim_token = NULL, lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE batch_key = ? AND status = 'sending' AND lease_expires_at <= ?
+                """,
+                (now.isoformat(), batch_key, now.isoformat()),
+            )
+            connection.execute(
+                """
+                UPDATE email_delivery_recipients
+                SET status = 'sending', claim_token = ?, lease_expires_at = ?,
+                    updated_at = ?
+                WHERE batch_key = ? AND status = 'pending'
+                """,
+                (claim_token, lease_expires_at, now.isoformat(), batch_key),
+            )
+            claimed = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT email FROM email_delivery_recipients
+                    WHERE batch_key = ? AND status = 'sending' AND claim_token = ?
+                    ORDER BY email
+                    """,
+                    (batch_key, claim_token),
+                )
+            )
+            failed = connection.execute(
+                """
+                SELECT 1 FROM email_delivery_recipients
+                WHERE batch_key = ? AND status = 'failed' LIMIT 1
+                """,
+                (batch_key,),
+            ).fetchone()
+            in_flight = connection.execute(
+                """
+                SELECT 1 FROM email_delivery_recipients
+                WHERE batch_key = ? AND status = 'sending' AND claim_token != ? LIMIT 1
+                """,
+                (batch_key, claim_token),
+            ).fetchone()
+            return claim_token, claimed, failed is not None, in_flight is not None
+
+    def finish_email_delivery_recipient(
+        self,
+        batch_key: str,
+        email: str,
+        claim_token: str,
+        *,
+        outcome: str,
+    ) -> bool:
+        if outcome not in {"pending", "sent", "failed"}:
+            raise ValueError("Invalid email delivery recipient outcome")
+        with self._connect(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE email_delivery_recipients
+                SET status = ?, claim_token = NULL, lease_expires_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE batch_key = ? AND email = ? AND status = 'sending'
+                  AND claim_token = ?
+                """,
+                (outcome, batch_key, email, claim_token),
+            )
+            return cursor.rowcount > 0
+
+    def renew_email_delivery_claim(
+        self,
+        batch_key: str,
+        claim_token: str,
+        now: datetime,
+        *,
+        stale_after: timedelta,
+    ) -> bool:
+        lease_expires_at = (now + stale_after).isoformat()
+        with self._connect(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE email_delivery_recipients
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE batch_key = ? AND status = 'sending' AND claim_token = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    lease_expires_at,
+                    now.isoformat(),
+                    batch_key,
+                    claim_token,
+                    now.isoformat(),
+                ),
             )
             return cursor.rowcount > 0
 
@@ -199,7 +561,7 @@ class Storage:
         with self._connect() as connection:
             if target is not None:
                 exists = connection.execute(
-                    "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                    "SELECT 1 FROM subscriptions WHERE id = ? AND control_target = ?",
                     (subscription_id, target),
                 ).fetchone()
                 if exists is None:
@@ -217,8 +579,7 @@ class Storage:
     @staticmethod
     def message_variants_revision(variants: list[MessageVariant]) -> str:
         payload = [
-            (item.kind, item.today_text, item.yesterday_text, item.weight)
-            for item in variants
+            (item.kind, item.today_text, item.yesterday_text, item.weight) for item in variants
         ]
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
@@ -243,7 +604,7 @@ class Storage:
             raise ValueError("Message variant weight must be between 1 and 100")
         with self._connect(immediate=True) as connection:
             exists = connection.execute(
-                "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                "SELECT 1 FROM subscriptions WHERE id = ? AND control_target = ?",
                 (subscription_id, target),
             ).fetchone()
             if exists is None:
@@ -290,7 +651,7 @@ class Storage:
                 WHERE id = ? AND subscription_id = ? AND kind = ?
                   AND EXISTS (
                     SELECT 1 FROM subscriptions
-                    WHERE id = ? AND target = ?
+                    WHERE id = ? AND control_target = ?
                   )
                 """,
                 (variant_id, subscription_id, kind, subscription_id, target),
@@ -308,7 +669,7 @@ class Storage:
             raise ValueError("Unknown message variant kind")
         with self._connect() as connection:
             exists = connection.execute(
-                "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                "SELECT 1 FROM subscriptions WHERE id = ? AND control_target = ?",
                 (subscription_id, target),
             ).fetchone()
             if exists is None:
@@ -349,7 +710,7 @@ class Storage:
             normalized.append((kind, today_text, yesterday_text, weight))
         with self._connect(immediate=True) as connection:
             exists = connection.execute(
-                "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                "SELECT 1 FROM subscriptions WHERE id = ? AND control_target = ?",
                 (subscription_id, target),
             ).fetchone()
             if exists is None:
@@ -436,7 +797,7 @@ class Storage:
                 subscription_id, digest_date, channel, target, reason,
                 delivery_attempt_count, status, created_at
             )
-            SELECT id, ?, channel, target, ?, ?, 'pending', ?
+            SELECT id, ?, 'telegram', control_target, ?, ?, 'pending', ?
             FROM subscriptions
             WHERE id = ?
             ON CONFLICT (subscription_id, digest_date) DO NOTHING
@@ -670,7 +1031,7 @@ class Storage:
         with self._connect() as connection:
             if subscription_id is not None:
                 exists = connection.execute(
-                    "SELECT 1 FROM subscriptions WHERE id = ? AND target = ?",
+                    "SELECT 1 FROM subscriptions WHERE id = ? AND control_target = ?",
                     (subscription_id, target),
                 ).fetchone()
                 if exists is None:
@@ -691,7 +1052,7 @@ class Storage:
                     COALESCE(SUM(d.attempt_count), 0) AS attempts
                 FROM deliveries d
                 JOIN subscriptions s ON s.id = d.subscription_id
-                WHERE s.target = ?{subscription_filter}
+                WHERE s.control_target = ?{subscription_filter}
                 """,
                 params,
             ).fetchone()
@@ -699,7 +1060,7 @@ class Storage:
                 f"""
                 SELECT d.* FROM deliveries d
                 JOIN subscriptions s ON s.id = d.subscription_id
-                WHERE s.target = ?{subscription_filter}
+                WHERE s.control_target = ?{subscription_filter}
                 ORDER BY d.digest_date DESC, d.attempted_at DESC
                 LIMIT 1
                 """,

@@ -22,7 +22,11 @@ def _configure_logging(settings: Settings) -> None:
     logging.basicConfig(level=logging.INFO)
     formatter = _SecretRedactingFormatter(
         "%(asctime)s %(levelname)s %(name)s: %(message)s",
-        secrets=(settings.telegram_bot_token, settings.telegram_proxy_url or ""),
+        secrets=(
+            settings.telegram_bot_token,
+            settings.telegram_proxy_url or "",
+            settings.smtp.password if settings.smtp and settings.smtp.password else "",
+        ),
     )
     for handler in logging.getLogger().handlers:
         handler.setFormatter(formatter)

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "behavior": "Email-рассылка управляется из Telegram, доставляет дайджест именованной группе адресатов и безопасно продолжает частично успешную отправку без повторной доставки уже обработанным получателям.",
+  "subject": {
+    "kind": "worktree",
+    "identity": "sha256:d8c1c741a50a636e4943541838fef8bfb4a5b141db75c4d782505fe22e8c4d5b"
+  },
+  "red": {
+    "command": [
+      "python",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/test_storage.py::test_email_recipient_claim_prevents_concurrent_delivery",
+      "tests/test_email_channel.py::test_email_channel_classifies_message_construction_errors"
+    ],
+    "exit_code": 1,
+    "summary": "2 tests failed: Storage не имел атомарного recipient claim, а ошибка формирования MIME выходила как необработанный ValueError.",
+    "failure_class": "intended_behavior",
+    "intended_behavior_failure_reason": "Сбои непосредственно подтвердили отсутствие защиты адресата от конкурентной повторной отправки и корректной классификации ошибок построения email."
+  },
+  "green": {
+    "focused": {
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_email_channel.py",
+        "tests/test_config.py",
+        "tests/test_storage.py",
+        "tests/test_bot.py",
+        "tests/test_service.py"
+      ],
+      "exit_code": 0,
+      "summary": "107 focused tests passed для SMTP, конфигурации, хранилища, Telegram-диалогов и сервиса доставки."
+    },
+    "broader": {
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "exit_code": 0,
+      "summary": "150 project tests passed."
+    }
+  },
+  "evidence_digest": "sha256:8e19ff5da3aa49133c1704fce10d3f05f499ea045d7ffae3b78cf0ba09bc737e"
+}
